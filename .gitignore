@@ -3,11 +3,14 @@ __pycache__/
 *.pyc
 
 # Virtual environment
-IbtisamX/
+IbtisamIQ/
+.venv/
+venv/
 
 # Environment variables and secrets (optional but recommended)
 .env
 *.env
+!.env.example
 
 # Logs
 *.log
@@ -20,3 +23,5 @@ Thumbs.db
 .coverage
 coverage.xml
 
+# Scratch files
+.scratchpad
