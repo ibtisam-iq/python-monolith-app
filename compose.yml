@@ -1,0 +1,58 @@
+# Docker Compose for local development and CI.
+# Production deployments should use Kubernetes or a managed platform.
+#
+# Usage:
+#   1. Copy .env.example to .env and fill in your values.
+#   2. docker compose up -d --build
+#   3. Visit http://localhost:5000
+
+services:
+
+  # ── Flask Application ────────────────────────────────────────────────────────
+  app:
+    build: .
+    container_name: flask-app
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # DATABASE_URL is the single connection string read by config.py.
+      # Format: postgresql://<user>:<password>@<host>:<port>/<database>
+      # 'db' here refers to the service name defined below — Docker Compose
+      # resolves service names as hostnames on the internal network.
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy  # Wait until PostgreSQL is actually ready
+    networks:
+      - app-network
+
+  # ── PostgreSQL Database ──────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine            # Lightweight Alpine-based Postgres image
+    container_name: postgres-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data  # Persist DB data across restarts
+    healthcheck:
+      # pg_isready checks if PostgreSQL is accepting connections.
+      # Retried every 5s, up to 5 times, before marking the service unhealthy.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+volumes:
+  postgres_data:  # Named volume — survives 'docker compose down' but NOT 'docker compose down -v'
+
+networks:
+  app-network:
+    driver: bridge
