@@ -2,7 +2,12 @@
 
 ## Overview
 
-This is a Python-based monolithic student management web application used as the **source codebase** for building real-world DevSecOps pipelines and platform engineering workflows.
+This is a Python Flask-based monolithic student management web application serving as the **source codebase** for two downstream DevOps projects:
+
+- **[DevSecOps Pipelines](https://github.com/ibtisam-iq/devsecops-pipelines)** — Showcasing how this application is built, scanned, and packaged into secure, deployable artifacts using Jenkins, GitHub Actions, Docker, SonarQube, and Trivy.
+- **[Platform Engineering Systems](https://github.com/ibtisam-iq/platform-engineering-systems)** — Showcasing how the application artifact is deployed, operated, monitored, and scaled across modern infrastructure using Docker Compose, AWS EC2, EKS (Kubernetes), Terraform, and GitOps practices.
+
+This repository contains the application code only. All DevOps work — CI/CD pipelines, deployment configurations, and infrastructure — lives in the repositories above, which reference this codebase via Git submodules.
 
 I did not build this application from scratch. As a DevOps Engineer, my focus is on everything that happens **around the code** — building, securing, packaging, and running it in production-like environments using industry-standard tooling.
 
