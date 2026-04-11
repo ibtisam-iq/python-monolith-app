@@ -1,0 +1,193 @@
+# Python Monolith Application
+
+## Overview
+
+This is a Python-based monolithic student management web application used as the **source codebase** for building real-world DevSecOps pipelines and platform engineering workflows.
+
+I did not build this application from scratch. As a DevOps Engineer, my focus is on everything that happens **around the code** — building, securing, packaging, and running it in production-like environments using industry-standard tooling.
+
+---
+
+## Application Structure
+
+```
+python-monolith-app/
+├── app/
+│   ├── __init__.py             # Application factory (create_app)
+│   ├── models.py               # SQLAlchemy ORM models
+│   ├── routes.py               # Route definitions and view logic
+│   ├── static/                 # CSS, JS, images
+│   └── templates/              # Jinja2 HTML templates
+├── tests/                      # Unit and integration tests
+├── config.py                   # Reads DATABASE_URL from environment
+├── run.py                      # Entry point — creates app, starts server
+├── requirements.txt            # Pinned Python dependencies
+├── .env.example                # Environment variable template
+├── Dockerfile
+└── compose.yml
+```
+
+Two-tier architecture: Presentation + Business Logic (Flask — routes, templates, ORM) → Data (PostgreSQL).
+
+> **Note:** Unlike the Java and Node projects which are three-tier (separate frontend, backend, and database layers), this is a classic two-tier server-side rendered monolith. Flask handles both the UI (Jinja2 templates) and the application logic in one process — there is no decoupled frontend.
+
+---
+
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.12 |
+| Framework | Flask 3.1 |
+| ORM | Flask-SQLAlchemy + SQLAlchemy 2.0 |
+| Database | PostgreSQL 16 |
+| Templating | Jinja2 |
+| WSGI Server | Gunicorn |
+| Build Tool | pip + requirements.txt |
+
+---
+
+## DevOps Implementation Journey
+
+### Step 0 — Codebase Modernization (`requirements.txt`)
+
+The inherited codebase was functional but had unpinned or loosely versioned dependencies. Before doing any DevOps work, I audited `requirements.txt` and pinned all dependencies to exact versions to ensure fully reproducible builds across all environments.
+
+> **Note:** Pinning dependencies is not strictly application development — it is a DevOps concern. Unpinned dependencies (`Flask>=2.0`) are a pipeline reliability risk: a new release can silently break a build or introduce a vulnerability between runs. I used **AI-assisted analysis (Perplexity Pro)** to audit the dependency tree, verify compatibility between Flask, SQLAlchemy, and psycopg2-binary, and determine the correct pinned versions — which is itself a practical DevOps skill.
+
+**Changes made to `requirements.txt`:**
+
+| Package | Before | After | Why |
+|---|---|---|---|
+| `Flask` | Unpinned / loose | `3.1.3` | Latest stable; pinned for reproducibility |
+| `Flask-SQLAlchemy` | Unpinned / loose | `3.1.1` | Compatible with SQLAlchemy 2.x |
+| `SQLAlchemy` | Unpinned / loose | `2.0.49` | SQLAlchemy 2.x is the current LTS with async support |
+| `psycopg2-binary` | Unpinned / loose | `2.9.11` | Latest stable PostgreSQL adapter |
+| `gunicorn` | Missing | `23.0.0` | Required by `Dockerfile` CMD — production WSGI server |
+| All transitive deps | Absent | Pinned | `blinker`, `click`, `greenlet`, `itsdangerous`, `Jinja2`, `MarkupSafe`, `Werkzeug`, `typing_extensions` all pinned for full reproducibility |
+
+---
+
+### Step 1 — Environment Standardization
+
+The original codebase had a hardcoded database URL fallback directly in `config.py`. I refactored it to read all configuration exclusively from environment variables, making it portable across all environments.
+
+```bash
+# Copy the template and fill in real values
+cp .env.example .env
+```
+
+Key variables set in `.env`:
+
+```env
+POSTGRES_USER=your_db_user
+POSTGRES_PASSWORD=your_db_password
+POSTGRES_DB=flask_db
+PORT=5000
+```
+
+The `DATABASE_URL` connection string is assembled by `compose.yml` and injected into the container:
+
+```
+DATABASE_URL=postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@db:5432/<POSTGRES_DB>
+```
+
+> **Note:** `db` in the connection string refers to the PostgreSQL service name defined in `compose.yml`. Docker Compose resolves service names as hostnames on the internal network. For local bare-metal runs without Docker, replace `db` with `localhost` and set `DATABASE_URL` manually.
+
+---
+
+### Step 2 — Local Build & Validation
+
+Before building any pipeline, I validated the full application lifecycle locally.
+
+**Install and configure PostgreSQL:**
+
+```bash
+sudo apt update && sudo apt install -y postgresql postgresql-contrib
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+
+# Create DB user and database
+sudo -u postgres psql
+```
+
+```sql
+CREATE DATABASE flask_db;
+CREATE USER your_db_user WITH PASSWORD 'your_db_password';
+GRANT ALL PRIVILEGES ON DATABASE flask_db TO your_db_user;
+\q
+```
+
+**Verify PostgreSQL is running and the database exists:**
+
+```bash
+# Check PostgreSQL is running
+sudo systemctl status postgresql
+
+# Confirm the database exists
+psql -U your_db_user -d flask_db -c "\l" | grep flask_db
+```
+
+**Set up a virtual environment and install dependencies:**
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+**Load env vars and run the application:**
+
+```bash
+set -a && source .env && set +a
+python run.py
+```
+
+> **Why `set -a`?** `set -a` marks every variable sourced from `.env` for automatic export into the child process (the Python interpreter). `set +a` turns off the flag after sourcing so subsequent shell variables are not unintentionally exported.
+
+> **Note:** Flask's built-in development server (`python run.py`) is used for local validation only. In Docker and all other environments, **Gunicorn** is the WSGI server (`gunicorn --bind 0.0.0.0:5000 run:app`). Never use the Flask dev server in production.
+
+App runs at: `http://localhost:5000`
+
+---
+
+### Step 3 — DevSecOps Pipelines (CI/CD)
+
+With the application validated locally, I built automated pipelines to transform this code into a secure, deployable artifact.
+
+Pipelines include: pip install → pytest → SonarQube analysis → Trivy vulnerability scan → Docker image build → Nexus artifact management → Jenkins & GitHub Actions automation.
+
+👉 **Pipelines repository:** [DevSecOps Pipelines](https://github.com/ibtisam-iq/devsecops-pipelines/tree/main/pipelines/python-monolith)
+
+---
+
+### Step 4 — Platform Engineering (Deployment & Operations)
+
+Once the artifact was ready, I deployed it using multiple industry-standard approaches.
+
+Deployment targets: Local bare-metal · Docker Compose · AWS EC2 · EKS (Kubernetes) · Terraform-provisioned infrastructure.
+
+Also covered: monitoring, observability, scaling strategies, and system reliability.
+
+👉 **Platform repository:** [Platform Engineering Systems](https://github.com/ibtisam-iq/platform-engineering-systems/tree/main/systems/python-monolith)
+
+---
+
+## Repository Role in the Larger System
+
+```
+python-monolith-app  ←  Single source of truth (codebase only)
+        │
+        ├── git submodule → DevSecOps Pipelines            (CI/CD)
+        └── git submodule → Platform Engineering Systems   (Deployment)
+```
+
+This repository holds only the application code. All DevOps work — pipelines, deployment configs, and infrastructure — lives in the downstream repositories and references this one via Git submodules.
+
+---
+
+## Key Idea
+
+> Code = Input. Everything else is built around it.
+
+The goal is not to showcase application development. The goal is to demonstrate how **any application** can be taken as input and transformed into a production-like system using DevSecOps and platform engineering practices.
