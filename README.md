@@ -4,12 +4,10 @@
 
 This is a Python Flask-based monolithic student management web application serving as the **source codebase** for two downstream DevOps projects:
 
-- **[DevSecOps Pipelines](https://github.com/ibtisam-iq/devsecops-pipelines)** — Showcasing how this application is built, scanned, and packaged into secure, deployable artifacts using Jenkins, GitHub Actions, Docker, SonarQube, and Trivy.
-- **[Platform Engineering Systems](https://github.com/ibtisam-iq/platform-engineering-systems)** — Showcasing how the application artifact is deployed, operated, monitored, and scaled across modern infrastructure using Docker Compose, AWS EC2, EKS (Kubernetes), Terraform, and GitOps practices.
+- **[DevSecOps Pipelines](https://github.com/ibtisam-iq/devsecops-pipelines)** — CI/CD pipelines that build, scan, and package this application into a secure, deployable artifact using Jenkins, GitHub Actions, Docker, SonarQube, and Trivy.
+- **[Platform Engineering Systems](https://github.com/ibtisam-iq/platform-engineering-systems)** — Deployment workflows that run this artifact across Docker Compose, AWS EC2, EKS (Kubernetes), Terraform, and GitOps-based delivery.
 
-This repository contains the application code only. All DevOps work — CI/CD pipelines, deployment configurations, and infrastructure — lives in the repositories above, which reference this codebase via Git submodules.
-
-I did not build this application from scratch. As a DevOps Engineer, my focus is on everything that happens **around the code** — building, securing, packaging, and running it in production-like environments using industry-standard tooling.
+> I did not build this application from scratch. As a DevOps Engineer, my focus is on everything that happens **around the code** — building, securing, packaging, and operating it in production-like environments.
 
 ---
 
@@ -178,21 +176,14 @@ Also covered: monitoring, observability, scaling strategies, and system reliabil
 
 ---
 
-## Repository Role in the Larger System
-
-```
-python-monolith-app  ←  Single source of truth (codebase only)
-        │
-        ├── git submodule → DevSecOps Pipelines            (CI/CD)
-        └── git submodule → Platform Engineering Systems   (Deployment)
-```
-
-This repository holds only the application code. All DevOps work — pipelines, deployment configs, and infrastructure — lives in the downstream repositories and references this one via Git submodules.
-
----
-
 ## Key Idea
 
-> Code = Input. Everything else is built around it.
+> Code = Input. Pipelines secure it. Infrastructure runs it.
 
-The goal is not to showcase application development. The goal is to demonstrate how **any application** can be taken as input and transformed into a production-like system using DevSecOps and platform engineering practices.
+| Repository | Role |
+|---|---|
+| **This repo** | Application source code — the single input to everything below |
+| **[DevSecOps Pipelines](https://github.com/ibtisam-iq/devsecops-pipelines)** | CI/CD — builds, scans, and packages the code into a deployable artifact |
+| **[Platform Engineering Systems](https://github.com/ibtisam-iq/platform-engineering-systems)** | Platform — deploys, operates, and scales the artifact across multiple targets |
+
+This separation is intentional: one repo per concern. The source code stays clean, the pipeline logic stays auditable, and the deployment configs stay independently versioned.
