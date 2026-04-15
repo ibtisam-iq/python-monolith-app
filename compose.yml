@@ -19,21 +19,32 @@ services:
     image: postgres:16-alpine
     container_name: postgres-db
     restart: unless-stopped
+
+    # env_file loads ALL variables from .env into this container's environment.
+    # The PostgreSQL image specifically looks for POSTGRES_USER, POSTGRES_PASSWORD,
+    # and POSTGRES_DB to initialize the database on first startup.
     env_file: .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    # NOTE: env_file alone would work here since the variable names match exactly
+    # what the postgres image expects. The explicit 'environment' block above is
+    # kept for clarity — it makes the required variables visible without opening .env.
+
     volumes:
       - postgres_data:/var/lib/postgresql/data  # Persists across restarts; removed only with 'down -v'
+
     healthcheck:
       # pg_isready checks if PostgreSQL is accepting connections.
-      # start_period gives the container time to initialize before failures count.
+      # The app service will not start until this check passes (see depends_on below).
+      # start_period: gives PostgreSQL time to initialize before failures start counting.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
+
     networks:
       - app-network
 
@@ -44,16 +55,31 @@ services:
       dockerfile: Dockerfile
     container_name: flask-app
     restart: unless-stopped
+
+    # env_file loads ALL variables from .env (POSTGRES_USER, POSTGRES_PASSWORD,
+    # POSTGRES_DB, DATABASE_URL, PORT) into this container's environment.
     env_file: .env
+
     environment:
-      # Override DATABASE_URL for Docker Compose — 'db' is the PostgreSQL service name,
-      # resolved as a hostname on the internal Docker network.
+      # WHY this override exists:
+      # .env has DATABASE_URL pointing to 'localhost' — correct for bare-metal runs.
+      # Inside Docker, 'localhost' means the container itself, NOT the db service.
+      # Docker Compose resolves service names as hostnames on the internal network,
+      # so 'db' is the correct host here.
+      # This single override is all that's needed — no separate .env file per environment.
+      # Docker Compose DOES expand ${...}, so variable references work here.
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
     ports:
-      - "${PORT:-5000}:5000"  # Host port from .env; container port is always 5000
+      # HOST_PORT:CONTAINER_PORT
+      # Container always listens on 5000 (hardcoded in Dockerfile CMD and EXPOSE).
+      # Host port comes from .env — defaults to 5000 if PORT is not set.
+      - "${PORT:-5000}:5000"
+
     depends_on:
       db:
-        condition: service_healthy  # Wait until PostgreSQL passes its healthcheck
+        condition: service_healthy  # App waits until PostgreSQL passes its healthcheck
+
     networks:
       - app-network
 
@@ -63,4 +89,4 @@ volumes:
 
 networks:
   app-network:
-    driver: bridge  # Explicit bridge network — makes inter-service DNS resolution reliable
+    driver: bridge  # Explicit bridge network — isolates services and enables reliable DNS between them
