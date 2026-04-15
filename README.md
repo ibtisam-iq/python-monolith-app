@@ -114,8 +114,12 @@ sudo -u postgres psql
 CREATE DATABASE flask_db;
 CREATE USER your_db_user WITH PASSWORD 'your_db_password';
 GRANT ALL PRIVILEGES ON DATABASE flask_db TO your_db_user;
+\c flask_db
+GRANT ALL ON SCHEMA public TO your_db_user;
 \q
 ```
+
+> **Note:** `GRANT ALL PRIVILEGES ON DATABASE` grants database-level rights (connect, create schemas). In PostgreSQL 15+, you must also explicitly grant schema-level rights with `GRANT ALL ON SCHEMA public` — otherwise the user cannot create tables. The `\c flask_db` switches into the database before granting schema permissions.
 
 **Verify PostgreSQL is running and the database exists:**
 
@@ -133,6 +137,12 @@ PGPASSWORD=your_db_password psql -U your_db_user -d flask_db -h 127.0.0.1 -c "\l
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+**Load environment variables:**
+
+```bash
+set -a && source .env && set +a
 ```
 
 **Run the test suite:**
