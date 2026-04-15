@@ -56,7 +56,7 @@ Two-tier architecture: Presentation + Business Logic (Flask — routes, template
 
 The inherited codebase was functional but had unpinned or loosely versioned dependencies. Before doing any DevOps work, I audited `requirements.txt` and pinned all dependencies to exact versions to ensure fully reproducible builds across all environments.
 
-> **Note:** Pinning dependencies is not strictly application development — it is a DevOps concern. Unpinned dependencies (`Flask>=2.0`) are a pipeline reliability risk: a new release can silently break a build or introduce a vulnerability between runs. I used **AI-assisted analysis (Perplexity Pro)** to audit the dependency tree, verify compatibility between Flask, SQLAlchemy, and psycopg2-binary, and determine the correct pinned versions — which is itself a practical DevOps skill.
+> **Note:** I used **AI-assisted analysis (Perplexity Pro)** to audit the dependency tree, verify compatibility between Flask, SQLAlchemy, and psycopg2-binary, and determine the correct pinned versions.
 
 **Changes made to `requirements.txt`:**
 
@@ -124,7 +124,7 @@ GRANT ALL PRIVILEGES ON DATABASE flask_db TO your_db_user;
 sudo systemctl status postgresql
 
 # Confirm the database exists
-psql -U your_db_user -d flask_db -c "\l" | grep flask_db
+PGPASSWORD=your_db_password psql -U your_db_user -d flask_db -h 127.0.0.1 -c "\l" | grep flask_db
 ```
 
 **Set up a virtual environment and install dependencies:**
