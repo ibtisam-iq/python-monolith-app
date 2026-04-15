@@ -21,11 +21,14 @@ python-monolith-app/
 │   ├── routes.py               # Route definitions and view logic
 │   ├── static/                 # CSS, JS, images
 │   └── templates/              # Jinja2 HTML templates
-├── tests/                      # Unit and integration tests
-├── config.py                   # Reads DATABASE_URL from environment
-├── run.py                      # Entry point — creates app, starts server
+├── tests/
+│   ├── conftest.py             # Loads .env before pytest collects tests
+│   └── test_app.py             # Unit tests for Item model
+├── config.py                   # Reads DATABASE_URL from environment; validates at startup
+├── run.py                      # Entry point — loads .env, creates app, starts server
 ├── requirements.txt            # Pinned Python dependencies
 ├── .env.example                # Environment variable template
+├── .gitignore                  # Excludes .env, .venv, __pycache__, etc.
 ├── Dockerfile
 └── compose.yml
 ```
@@ -52,36 +55,54 @@ Two-tier architecture: Presentation + Business Logic (Flask — routes, template
 
 ## DevOps Implementation Journey
 
-### Step 0 — Codebase Modernization (`requirements.txt`)
+### Step 0 — Codebase Modernization
 
-The inherited codebase was functional but had unpinned or loosely versioned dependencies. Before doing any DevOps work, I audited `requirements.txt` and pinned all dependencies to exact versions to ensure fully reproducible builds across all environments.
+Before doing any DevOps work, I audited and modernized the inherited codebase to make it pipeline-ready and production-grade.
 
-> **Note:** I used **AI-assisted analysis (Perplexity Pro)** to audit the dependency tree, verify compatibility between Flask, SQLAlchemy, and psycopg2-binary, and determine the correct pinned versions.
+#### `requirements.txt` — Pinned all dependencies
 
-**Changes made to `requirements.txt`:**
+The original file had unpinned or loosely versioned dependencies — a pipeline reliability risk. I pinned every package to an exact version for fully reproducible builds.
 
-| Package | Before | After | Why |
-|---|---|---|---|
-| `Flask` | Unpinned / loose | `3.1.3` | Latest stable; pinned for reproducibility |
-| `Flask-SQLAlchemy` | Unpinned / loose | `3.1.1` | Compatible with SQLAlchemy 2.x |
-| `SQLAlchemy` | Unpinned / loose | `2.0.49` | SQLAlchemy 2.x is the current LTS with async support |
-| `psycopg2-binary` | Unpinned / loose | `2.9.11` | Latest stable PostgreSQL adapter |
-| `gunicorn` | Missing | `23.0.0` | Required by `Dockerfile` CMD — production WSGI server |
-| `pytest` | Missing | `8.3.5` | Required to run the test suite |
-| All transitive deps | Absent | Pinned | `blinker`, `click`, `greenlet`, `itsdangerous`, `Jinja2`, `MarkupSafe`, `Werkzeug`, `typing_extensions` all pinned for full reproducibility |
+| Package | Change | Why |
+|---|---|---|
+| `Flask`, `Flask-SQLAlchemy`, `SQLAlchemy`, `psycopg2-binary` | Pinned to latest stable | Reproducible builds across all environments |
+| `gunicorn` | Added (was missing) | Required by `Dockerfile` CMD — production WSGI server |
+| `pytest` | Added (was missing) | Required to run the test suite |
+| `python-dotenv` | Added (was missing) | Auto-loads `.env` in `run.py` and `conftest.py` |
+| All transitive deps | Added and pinned | `blinker`, `click`, `greenlet`, `itsdangerous`, `Jinja2`, `MarkupSafe`, `Werkzeug`, `typing_extensions` |
+
+#### `config.py` — Removed hardcoded DB fallback
+
+The original code had a hardcoded `postgresql://root:root@localhost/my_database` fallback. I removed it entirely. `DATABASE_URL` is now read exclusively from the environment. A `validate()` method raises a clear `EnvironmentError` at app startup (not at import time) if the variable is unset — so pytest can import models freely without triggering the error.
+
+#### `app/__init__.py` — Runtime validation
+
+Moved `Config.validate()` call inside `create_app()` so the environment check only fires when the Flask app actually starts — not during module import. This separates test imports from runtime requirements.
+
+#### `run.py` — Auto-loads `.env`
+
+Added `python-dotenv` to auto-load `.env` at startup. No need to manually `source .env` before running the app.
+
+#### `tests/conftest.py` — New file
+
+pytest auto-runs `conftest.py` before collecting tests. It loads `.env` so `DATABASE_URL` is available for any test that needs it, while tests that mock the DB continue to work without a real connection.
+
+#### `.env.example` — New file
+
+Added an environment variable template safe to commit. Documents all required variables with inline comments. Developers copy it to `.env` and fill in real values — `.env` itself is excluded from version control via `.gitignore`.
 
 ---
 
 ### Step 1 — Environment Standardization
 
-The original codebase had a hardcoded database URL fallback directly in `config.py`. I refactored it to read all configuration exclusively from environment variables, making it portable across all environments.
+All configuration is now driven by environment variables. No hardcoded values exist anywhere in the codebase.
 
 ```bash
 # Copy the template and fill in real values
 cp .env.example .env
 ```
 
-Key variables set in `.env`:
+Key variables in `.env`:
 
 ```env
 POSTGRES_USER=your_db_user
@@ -91,7 +112,7 @@ DATABASE_URL=postgresql://your_db_user:your_db_password@localhost:5432/flask_db
 PORT=5000
 ```
 
-> **Note:** The `DATABASE_URL` above uses `localhost` for local bare-metal runs. For Docker Compose, replace `localhost` with `db` — the PostgreSQL service name defined in `compose.yml`. Docker Compose resolves service names as hostnames on the internal network.
+> **Note:** Write `DATABASE_URL` with literal values, not `${...}` shell variables — bash substitution does not work when loading `.env` with `python-dotenv`. Use `localhost` for bare-metal runs. For Docker Compose, replace `localhost` with `db` (the PostgreSQL service name in `compose.yml`).
 
 ---
 
@@ -106,7 +127,7 @@ sudo apt update && sudo apt install -y postgresql postgresql-contrib
 sudo systemctl start postgresql
 sudo systemctl enable postgresql
 
-# Create DB user and database
+# Enter the postgres superuser shell
 sudo -u postgres psql
 ```
 
@@ -119,15 +140,12 @@ GRANT ALL ON SCHEMA public TO your_db_user;
 \q
 ```
 
-> **Note:** `GRANT ALL PRIVILEGES ON DATABASE` grants database-level rights (connect, create schemas). In PostgreSQL 15+, you must also explicitly grant schema-level rights with `GRANT ALL ON SCHEMA public` — otherwise the user cannot create tables. The `\c flask_db` switches into the database before granting schema permissions.
+> **Note (PostgreSQL 15+):** `GRANT ALL PRIVILEGES ON DATABASE` grants database-level rights only. In PostgreSQL 15+, you must also grant schema-level rights separately — otherwise the user cannot create tables. `\c flask_db` switches into the database before the schema grant.
 
-**Verify PostgreSQL is running and the database exists:**
+**Verify PostgreSQL is running:**
 
 ```bash
-# Check PostgreSQL is running
 sudo systemctl status postgresql
-
-# Confirm the database exists
 PGPASSWORD=your_db_password psql -U your_db_user -d flask_db -h 127.0.0.1 -c "\l" | grep flask_db
 ```
 
@@ -139,19 +157,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Load environment variables:**
-
-```bash
-set -a && source .env && set +a
-```
-
 **Run the test suite:**
 
 ```bash
 pytest tests/
 ```
 
-> The test suite covers unit tests for the `Item` model — object creation, `__repr__`, and mocked query logic. No database connection is required to run these tests.
+> 4 tests pass. The suite covers unit tests for the `Item` model — object creation, `__repr__`, and mocked query logic. No real database connection is required.
 
 **Run the application:**
 
