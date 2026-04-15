@@ -67,6 +67,7 @@ The inherited codebase was functional but had unpinned or loosely versioned depe
 | `SQLAlchemy` | Unpinned / loose | `2.0.49` | SQLAlchemy 2.x is the current LTS with async support |
 | `psycopg2-binary` | Unpinned / loose | `2.9.11` | Latest stable PostgreSQL adapter |
 | `gunicorn` | Missing | `23.0.0` | Required by `Dockerfile` CMD — production WSGI server |
+| `pytest` | Missing | `8.3.5` | Required to run the test suite |
 | All transitive deps | Absent | Pinned | `blinker`, `click`, `greenlet`, `itsdangerous`, `Jinja2`, `MarkupSafe`, `Werkzeug`, `typing_extensions` all pinned for full reproducibility |
 
 ---
@@ -133,6 +134,14 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+**Run the test suite:**
+
+```bash
+pytest tests/
+```
+
+> The test suite covers unit tests for the `Item` model — object creation, `__repr__`, and mocked query logic. No database connection is required to run these tests.
 
 **Run the application:**
 
