@@ -1,9 +1,12 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Docker Compose — local development and integration testing stack.
+# Production deployments should use Kubernetes or a managed platform.
 #
 # Usage:
 #   docker compose up --build          # Build and start both services
-#   docker compose down -v             # Stop and remove containers + volumes
+#   docker compose up -d --build       # Run in detached mode
+#   docker compose down                # Stop and remove containers
+#   docker compose down -v             # Stop and also remove named volumes
 #   docker compose logs -f app         # Tail app logs
 #
 # Before running: ensure .env exists with real values (cp .env.example .env)
@@ -11,8 +14,10 @@
 
 services:
 
+  # ── PostgreSQL Database ─────────────────────────────────────────────────────
   db:
     image: postgres:16-alpine
+    container_name: postgres-db
     restart: unless-stopped
     env_file: .env
     environment:
@@ -20,18 +25,24 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data  # Persists across restarts; removed only with 'down -v'
     healthcheck:
+      # pg_isready checks if PostgreSQL is accepting connections.
+      # start_period gives the container time to initialize before failures count.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - app-network
 
+  # ── Flask Application ───────────────────────────────────────────────────────
   app:
     build:
       context: .
       dockerfile: Dockerfile
+    container_name: flask-app
     restart: unless-stopped
     env_file: .env
     environment:
@@ -39,11 +50,17 @@ services:
       # resolved as a hostname on the internal Docker network.
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     ports:
-      - "${PORT:-5000}:5000"
+      - "${PORT:-5000}:5000"  # Host port from .env; container port is always 5000
     depends_on:
       db:
-        condition: service_healthy
+        condition: service_healthy  # Wait until PostgreSQL passes its healthcheck
+    networks:
+      - app-network
 
 volumes:
   postgres_data:
-    driver: local
+    driver: local  # Named volume — survives 'docker compose down' but NOT 'docker compose down -v'
+
+networks:
+  app-network:
+    driver: bridge  # Explicit bridge network — makes inter-service DNS resolution reliable
