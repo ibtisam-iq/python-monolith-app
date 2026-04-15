@@ -1,0 +1,49 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Docker Compose — local development and integration testing stack.
+#
+# Usage:
+#   docker compose up --build          # Build and start both services
+#   docker compose down -v             # Stop and remove containers + volumes
+#   docker compose logs -f app         # Tail app logs
+#
+# Before running: ensure .env exists with real values (cp .env.example .env)
+# ──────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override DATABASE_URL for Docker Compose — 'db' is the PostgreSQL service name,
+      # resolved as a hostname on the internal Docker network.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    ports:
+      - "${PORT:-5000}:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+    driver: local

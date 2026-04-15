@@ -1,0 +1,29 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*.pyo
+.venv
+venv
+*.egg-info
+dist
+build
+
+# Environment — NEVER bake secrets into the image
+.env
+
+# Tests — not needed in the production image
+tests/
+
+# Editor and OS artifacts
+.vscode
+.idea
+*.DS_Store
+
+# README and docs
+README.md
+images/
