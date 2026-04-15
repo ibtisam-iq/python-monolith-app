@@ -32,7 +32,7 @@ python-monolith-app/
 
 Two-tier architecture: Presentation + Business Logic (Flask — routes, templates, ORM) → Data (PostgreSQL).
 
-> **Note:** Unlike the Java and Node projects which are three-tier (separate frontend, backend, and database layers), this is a classic two-tier server-side rendered monolith. Flask handles both the UI (Jinja2 templates) and the application logic in one process — there is no decoupled frontend.
+> **Note:** This is a classic two-tier server-side rendered monolith. Flask handles both the UI (Jinja2 templates) and the application logic in one process — there is no decoupled frontend.
 
 ---
 
@@ -86,16 +86,11 @@ Key variables set in `.env`:
 POSTGRES_USER=your_db_user
 POSTGRES_PASSWORD=your_db_password
 POSTGRES_DB=flask_db
+DATABASE_URL=postgresql://your_db_user:your_db_password@localhost:5432/flask_db
 PORT=5000
 ```
 
-The `DATABASE_URL` connection string is assembled by `compose.yml` and injected into the container:
-
-```
-DATABASE_URL=postgresql://<POSTGRES_USER>:<POSTGRES_PASSWORD>@db:5432/<POSTGRES_DB>
-```
-
-> **Note:** `db` in the connection string refers to the PostgreSQL service name defined in `compose.yml`. Docker Compose resolves service names as hostnames on the internal network. For local bare-metal runs without Docker, replace `db` with `localhost` and set `DATABASE_URL` manually.
+> **Note:** The `DATABASE_URL` above uses `localhost` for local bare-metal runs. For Docker Compose, replace `localhost` with `db` — the PostgreSQL service name defined in `compose.yml`. Docker Compose resolves service names as hostnames on the internal network.
 
 ---
 
@@ -134,21 +129,16 @@ psql -U your_db_user -d flask_db -c "\l" | grep flask_db
 **Set up a virtual environment and install dependencies:**
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-**Load env vars and run the application:**
+**Run the application:**
 
 ```bash
-set -a && source .env && set +a
 python run.py
 ```
-
-> **Why `set -a`?** `set -a` marks every variable sourced from `.env` for automatic export into the child process (the Python interpreter). `set +a` turns off the flag after sourcing so subsequent shell variables are not unintentionally exported.
-
-> **Note:** Flask's built-in development server (`python run.py`) is used for local validation only. In Docker and all other environments, **Gunicorn** is the WSGI server (`gunicorn --bind 0.0.0.0:5000 run:app`). Never use the Flask dev server in production.
 
 App runs at: `http://localhost:5000`
 
