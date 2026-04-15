@@ -1,19 +1,20 @@
 from flask import Flask
-from .models import db
-from config import Config  # Import Config class — do NOT hardcode DB URI here
+from flask_sqlalchemy import SQLAlchemy
+from config import Config
+
+db = SQLAlchemy()
 
 def create_app():
-    app = Flask(__name__)
+    # Validate required environment variables at app startup — not at import time.
+    # This allows pytest to import models without a real DATABASE_URL set.
+    Config.validate()
 
-    # Load all config (DATABASE_URL, TRACK_MODIFICATIONS, etc.) from Config class.
-    # Config reads DATABASE_URL exclusively from the environment.
-    # Raises EnvironmentError if DATABASE_URL is not set — no fallback.
-    # To set: define DATABASE_URL in your .env file or Docker Compose environment block.
+    app = Flask(__name__)
     app.config.from_object(Config)
 
     db.init_app(app)
 
-    from .routes import main
+    from app.routes import main
     app.register_blueprint(main)
 
     with app.app_context():
