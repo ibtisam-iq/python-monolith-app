@@ -1,8 +1,10 @@
 # Understand Dockerization — Python Flask + PostgreSQL
 
 This document explains **how to Dockerize any Python Flask application** from scratch.
-Everything here is derived from the real decisions made in this project — including
+Everything here is derived from real decisions made in this project — including
 what worked, what failed, and why each choice was made.
+It also covers every possible Dockerization approach so you can apply this knowledge
+to future projects regardless of their architecture.
 
 ---
 
@@ -10,20 +12,26 @@ what worked, what failed, and why each choice was made.
 
 1. [The Big Picture — What Dockerization Means](#1-the-big-picture)
 2. [Understand the Project Before Writing a Single Line](#2-understand-the-project-first)
-3. [The Dockerfile — Line by Line](#3-the-dockerfile)
-4. [Multi-Stage Builds — Why and How](#4-multi-stage-builds)
-5. [psycopg2 vs psycopg2-binary — A Critical Distinction](#5-psycopg2-vs-psycopg2-binary)
-6. [Non-Root User — Security Inside Containers](#6-non-root-user)
-7. [gunicorn — Why Not Flask's Built-in Server](#7-gunicorn)
-8. [Environment Variables Strategy](#8-environment-variables-strategy)
-9. [docker compose — Orchestrating Multiple Containers](#9-docker-compose)
-10. [Networking — How Containers Talk to Each Other](#10-networking)
-11. [Healthchecks — Why depends_on Alone is Not Enough](#11-healthchecks)
-12. [Volumes — Persisting Database Data](#12-volumes)
-13. [.dockerignore — What NOT to Copy](#13-dockerignore)
-14. [The SQLAlchemy Pitfall — Duplicate db Instances](#14-the-sqlalchemy-pitfall)
-15. [Mental Model — Bare-Metal vs Docker Compose](#15-mental-model)
-16. [Quick Reference — Commands](#16-quick-reference)
+3. [2-Tier vs 3-Tier Architecture — Know What You Are Dockerizing](#3-2-tier-vs-3-tier-architecture)
+4. [Integrated vs Separated Frontend — How to Identify](#4-integrated-vs-separated-frontend)
+5. [The Dockerfile — Line by Line](#5-the-dockerfile)
+6. [Multi-Stage Builds — Why and How](#6-multi-stage-builds)
+7. [psycopg2 vs psycopg2-binary — A Critical Distinction](#7-psycopg2-vs-psycopg2-binary)
+8. [Non-Root User — Security Inside Containers](#8-non-root-user)
+9. [gunicorn — Why Not Flask's Built-in Server](#9-gunicorn)
+10. [Multiple Dockerfiles — When and Why](#10-multiple-dockerfiles)
+11. [Approach A — Single Container (This Project)](#11-approach-a--single-container-this-project)
+12. [Approach B — Separate Nginx Frontend Container](#12-approach-b--separate-nginx-frontend-container)
+13. [Approach C — Full 3-Tier with React Frontend](#13-approach-c--full-3-tier-with-react-frontend)
+14. [Environment Variables Strategy](#14-environment-variables-strategy)
+15. [docker compose — Orchestrating Multiple Containers](#15-docker-compose)
+16. [Networking — How Containers Talk to Each Other](#16-networking)
+17. [Healthchecks — Why depends_on Alone is Not Enough](#17-healthchecks)
+18. [Volumes — Persisting Database Data](#18-volumes)
+19. [.dockerignore — What NOT to Copy](#19-dockerignore)
+20. [The SQLAlchemy Pitfall — Duplicate db Instances](#20-the-sqlalchemy-pitfall)
+21. [Mental Model — Bare-Metal vs Docker Compose](#21-mental-model)
+22. [Quick Reference — Commands](#22-quick-reference)
 
 ---
 
@@ -61,21 +69,163 @@ For a Flask + PostgreSQL app, Dockerization involves:
 
 Before writing a Dockerfile for ANY Python project, answer these questions:
 
-| Question | This Project's Answer |
+| Question | What to look for |
 |---|---|
-| What Python version? | 3.12 (check `runtime.txt` or `pyproject.toml` or `requirements.txt`) |
-| What does the app need at runtime? | Flask, SQLAlchemy, gunicorn, psycopg2-binary |
-| Does it need a database? | Yes — PostgreSQL |
-| Does it need build tools to compile? | No — psycopg2-**binary** is pre-compiled |
-| How is it started? | `python run.py` bare-metal, `gunicorn run:app` in production |
-| What port does it listen on? | 5000 |
-| What config does it need? | `DATABASE_URL`, `PORT` via environment variables |
+| What Python version? | `runtime.txt`, `pyproject.toml`, `requirements.txt`, `Pipfile` |
+| What does the app need at runtime? | `requirements.txt` — all libraries listed |
+| Does it need a database? | Look for SQLAlchemy, psycopg2, pymysql, pymongo in requirements |
+| Does it need build tools to compile? | `psycopg2` (no -binary) needs gcc; `psycopg2-binary` does not |
+| How is it started? | Check `run.py`, `manage.py`, `Procfile`, `README` |
+| What port does it listen on? | Look for `app.run(port=...)` or `PORT` env var |
+| What config does it need? | Look for `os.environ.get(...)` calls in `config.py` |
+| Is there a frontend framework? | React/Vue/Angular → separate container; Jinja2 templates → same container |
+| Is it 2-tier or 3-tier? | See Section 3 below |
 
-Knowing these answers determines every decision in the Dockerfile.
+**This project's answers:**
+
+| Question | Answer |
+|---|---|
+| Python version | 3.12 |
+| Runtime dependencies | Flask, SQLAlchemy, gunicorn, psycopg2-binary |
+| Database | PostgreSQL |
+| Build tools needed | None — psycopg2-binary is pre-compiled |
+| Start command | `gunicorn run:app` in production |
+| Port | 5000 |
+| Config needed | `DATABASE_URL`, `PORT` |
+| Frontend type | Jinja2 templates (integrated — same container as Flask) |
+| Architecture | 2-tier |
 
 ---
 
-## 3. The Dockerfile — Line by Line
+## 3. 2-Tier vs 3-Tier Architecture
+
+Understanding the architecture of the project determines HOW MANY containers
+you need and HOW MANY Dockerfiles you write.
+
+### 2-Tier Architecture
+
+```
+┌───────────────────────────────────────┐
+│         Client (Browser)              │
+└──────────────────┬────────────────────┘
+                   │ HTTP request
+┌──────────────────▼────────────────────┐
+│    Tier 1: Application (Flask)        │
+│    - Business logic                   │
+│    - Renders HTML via Jinja2          │
+│    - Serves static files (CSS/JS)     │
+└──────────────────┬────────────────────┘
+                   │ SQL queries
+┌──────────────────▼────────────────────┐
+│    Tier 2: Database (PostgreSQL)      │
+└───────────────────────────────────────┘
+```
+
+- Flask handles BOTH the business logic AND the presentation (HTML rendering)
+- No separate frontend framework
+- **This project is 2-tier**
+- Dockerization: **2 containers** — Flask app + PostgreSQL
+- Dockerfiles needed: **1** (for Flask; PostgreSQL uses the official image)
+
+### 3-Tier Architecture
+
+```
+┌───────────────────────────────────────┐
+│         Client (Browser)              │
+└──────────────────┬────────────────────┘
+                   │ HTTP
+┌──────────────────▼────────────────────┐
+│  Tier 1: Presentation (React/Vue/     │
+│          Angular or Nginx)            │
+└──────────────────┬────────────────────┘
+                   │ REST API / JSON
+┌──────────────────▼────────────────────┐
+│  Tier 2: Application (Flask API)      │
+│  - Business logic only                │
+│  - Returns JSON, not HTML             │
+└──────────────────┬────────────────────┘
+                   │ SQL queries
+┌──────────────────▼────────────────────┐
+│  Tier 3: Database (PostgreSQL)        │
+└───────────────────────────────────────┘
+```
+
+- Flask serves ONLY API endpoints (returns JSON, no HTML templates)
+- Frontend is a completely separate project (React, Vue, Angular)
+- Dockerization: **3 containers** — Frontend + Flask API + PostgreSQL
+- Dockerfiles needed: **2** (Frontend + Flask; PostgreSQL uses official image)
+
+### Summary Table
+
+| | 2-Tier | 3-Tier |
+|---|---|---|
+| Frontend | Jinja2 templates inside Flask | React/Vue/Angular — separate project |
+| Flask returns | HTML pages | JSON responses |
+| Containers | 2 | 3 |
+| Dockerfiles | 1 | 2 |
+| Complexity | Simpler | More modular |
+| Scalability | Limited | Frontend/backend scale independently |
+
+---
+
+## 4. Integrated vs Separated Frontend — How to Identify
+
+When you pick up someone else's Python project, use these signals to determine
+whether the frontend is integrated or separate.
+
+### Signs of Integrated Frontend (2-Tier)
+
+```
+project/
+├── app/
+│   ├── templates/        ← HTML files rendered by Flask (Jinja2)
+│   │   ├── index.html
+│   │   └── layout.html
+│   ├── static/           ← CSS/JS served directly by Flask
+│   │   └── css/style.css
+│   ├── routes.py         ← returns render_template(...), not jsonify(...)
+│   └── models.py
+├── config.py
+└── run.py
+```
+
+**Key indicator in `routes.py`:**
+```python
+# Integrated — Flask renders HTML
+return render_template('index.html', items=items)  # ← 2-tier
+```
+
+### Signs of Separated Frontend (3-Tier)
+
+```
+project/
+├── backend/              ← Flask API only
+│   ├── app/
+│   │   └── routes.py     ← returns jsonify(...), no templates
+│   └── run.py
+└── frontend/             ← completely separate project
+    ├── src/
+    │   ├── components/
+    │   └── App.jsx
+    ├── public/
+    └── package.json      ← Node.js frontend build system
+```
+
+**Key indicator in `routes.py`:**
+```python
+# Separated — Flask returns JSON only
+return jsonify({'items': items})  # ← 3-tier
+```
+
+**Other signals:**
+- `package.json` in the project → frontend build system (Node/React/Vue)
+- `.jsx`, `.tsx`, `.vue` files → separate frontend framework
+- No `templates/` folder in backend → Flask is API-only
+- Routes like `/api/users`, `/api/items` → REST API pattern
+
+---
+
+## 5. The Dockerfile — Line by Line
 
 ```dockerfile
 # Stage 1: Builder
@@ -84,6 +234,18 @@ FROM python:3.12-slim AS builder
 
 `python:3.12-slim` is a Debian-based image with Python pre-installed but without
 extra tools. `AS builder` names this stage — we reference it later in Stage 2.
+
+**Base image choices:**
+
+| Image | Size | OS | Use when |
+|---|---|---|---|
+| `python:3.12` | ~1GB | Debian | Full toolchain needed |
+| `python:3.12-slim` | ~130MB | Debian | Most production apps |
+| `python:3.12-alpine` | ~50MB | Alpine | Absolute minimum size |
+
+> **Warning:** Alpine uses `musl libc` instead of `glibc`. Some Python packages
+> (especially those with C extensions) can behave unexpectedly on Alpine.
+> Prefer `slim` for reliability.
 
 ```dockerfile
 WORKDIR /app
@@ -95,7 +257,7 @@ Sets the working directory inside the container. All subsequent `COPY`, `RUN`,
 ```dockerfile
 COPY requirements.txt .
 RUN pip install --upgrade pip \
-    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt
 ```
 
 **Why copy `requirements.txt` before the rest of the code?**
@@ -103,37 +265,67 @@ Docker builds in layers. If `requirements.txt` hasn't changed, Docker reuses the
 cached layer and skips reinstalling dependencies — even if your application code
 changed. This makes rebuilds significantly faster.
 
-`--prefix=/install` installs packages into `/install` instead of the system Python.
-This allows us to copy just the installed packages into Stage 2 cleanly.
-
 `--no-cache-dir` tells pip not to cache downloaded packages — reduces image size.
+
+```dockerfile
+COPY . .
+```
+
+Copies all remaining application files. This layer changes every time your code
+changes — but because it comes AFTER the pip install layer, dependency installation
+is still cached.
 
 ---
 
-## 4. Multi-Stage Builds
+## 6. Multi-Stage Builds
+
+A multi-stage build uses multiple `FROM` instructions in one Dockerfile.
+Each `FROM` starts a new stage. Only what you explicitly `COPY --from=<stage>`
+carries forward. Everything else is discarded.
 
 ```dockerfile
-# Stage 2: Runtime
+# ── Stage 1: Builder ─────────────────────────────────────────────────────────
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --upgrade pip \
+    && pip install --prefix=/install --no-cache-dir -r requirements.txt
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /install /usr/local   # ← only packages, no build tools
+COPY . .
 ```
 
-Start completely fresh from a clean base image. Stage 1 (builder) is discarded.
-Only what we explicitly copy from it survives.
+**`--prefix=/install`** installs packages into `/install` instead of the
+system Python. This isolates them so Stage 2 can copy them cleanly.
 
+**Alternative — virtual environment approach:**
 ```dockerfile
-COPY --from=builder /install /usr/local
+# Stage 1
+FROM python:3.12-slim AS builder
+WORKDIR /app
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Stage 2
+FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /opt/venv /opt/venv   # ← copy entire venv
+ENV PATH="/opt/venv/bin:$PATH"
+COPY . .
 ```
 
-Copies only the installed Python packages from Stage 1 into the final image.
-The result: the final image has NO build tools, NO compiler, NO pip cache —
-only what the app actually needs to run.
+Both approaches achieve the same goal. The venv approach is more explicit and
+isolated; the `--prefix` approach is slightly more concise.
 
 **Why does image size matter?**
 - Smaller images pull faster in CI/CD and Kubernetes
 - Smaller attack surface — fewer binaries an attacker can exploit
 - Follows the principle of least privilege at the infrastructure level
-
-**Single-stage vs Multi-stage comparison:**
 
 | | Single Stage | Multi-Stage |
 |---|---|---|
@@ -144,7 +336,7 @@ only what the app actually needs to run.
 
 ---
 
-## 5. psycopg2 vs psycopg2-binary
+## 7. psycopg2 vs psycopg2-binary
 
 This is one of the most common sources of Docker build confusion.
 
@@ -154,14 +346,13 @@ This is one of the most common sources of Docker build confusion.
 | `psycopg2-binary` | Pre-compiled, self-contained binary | ❌ No |
 
 **If your `requirements.txt` has `psycopg2` (no `-binary`):**
-You MUST install `gcc` and `libpq-dev` in the builder stage:
 ```dockerfile
+# Builder stage — needs compiler and PostgreSQL headers
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev \
     && rm -rf /var/lib/apt/lists/*
-```
-And in the runtime stage, you still need the shared library:
-```dockerfile
+
+# Runtime stage — needs only the shared library, not the compiler
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     && rm -rf /var/lib/apt/lists/*
@@ -169,13 +360,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 **If your `requirements.txt` has `psycopg2-binary`:**
 Install NOTHING extra. The binary bundles everything it needs.
-Adding `gcc` and `libpq-dev` would only waste image size.
 
-**This project uses `psycopg2-binary`** — so no system packages are needed.
+> **This project uses `psycopg2-binary`** — no system packages needed.
 
 ---
 
-## 6. Non-Root User
+## 8. Non-Root User
 
 ```dockerfile
 RUN groupadd --system appgroup && useradd --system --gid appgroup appuser
@@ -188,20 +378,21 @@ the container — and potentially to the host.
 
 **Always create and switch to a non-root user.**
 
-**`groupadd` vs `addgroup`:**
-- `groupadd` / `useradd` — correct syntax for **Debian/Ubuntu** based images
-  (`python:3.12-slim` is Debian)
-- `addgroup` / `adduser` — correct syntax for **Alpine** based images
-  (`python:3.12-alpine`)
+**`groupadd` vs `addgroup` — which to use:**
 
-Using Alpine syntax on a Debian image will fail silently or produce errors.
+| Command | OS | Base image |
+|---|---|---|
+| `groupadd` / `useradd` | Debian/Ubuntu | `python:3.12-slim`, `python:3.12` |
+| `addgroup` / `adduser` | Alpine | `python:3.12-alpine`, `nginx:alpine` |
 
-**`--system` flag** creates a system account (no home directory, no shell, no
-login) — appropriate for service accounts running application processes.
+Using Alpine syntax on a Debian image (or vice versa) will fail.
+
+**`--system` flag** creates a system account with no home directory, no shell,
+and no login — appropriate for service accounts running application processes.
 
 ---
 
-## 7. gunicorn
+## 9. gunicorn
 
 ```dockerfile
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "3", "--timeout", "120", "run:app"]
@@ -215,35 +406,282 @@ It is single-threaded, not designed for concurrent requests, and lacks stability
 - Manages worker lifecycle (restarts crashed workers)
 - Integrates with Nginx as a reverse proxy
 
-**Breaking down the command:**
-
 | Argument | Meaning |
 |---|---|
-| `--bind 0.0.0.0:5000` | Listen on all network interfaces inside the container on port 5000 |
+| `--bind 0.0.0.0:5000` | Listen on all network interfaces on port 5000 |
 | `--workers 3` | Spawn 3 worker processes. Rule of thumb: `2 * CPU_cores + 1` |
 | `--timeout 120` | Kill workers that don't respond within 120 seconds |
 | `run:app` | Import the `app` object from `run.py` — `module:variable` format |
 
-**Why is port 5000 hardcoded here?**
-CMD in exec form (`["..."]`) does NOT expand environment variables like `$PORT`.
-The container's internal port is always fixed. The host-facing port is controlled
-in `compose.yml` via `"${PORT:-5000}:5000"` — Docker handles the mapping.
+**Why is port 5000 hardcoded?**
+CMD exec form does NOT expand `$PORT`. The container's internal port is always
+fixed. Host port is controlled in `compose.yml` via `"${PORT:-5000}:5000"`.
 
 **exec form vs shell form:**
 ```dockerfile
-# Exec form — RECOMMENDED
+# Exec form — RECOMMENDED — signals go directly to gunicorn
 CMD ["gunicorn", "--bind", "0.0.0.0:5000", "run:app"]
 
-# Shell form — NOT recommended
+# Shell form — NOT recommended — signals go to /bin/sh wrapper, not gunicorn
 CMD gunicorn --bind 0.0.0.0:${PORT:-5000} run:app
 ```
-Exec form receives signals (SIGTERM, SIGINT) directly — gunicorn shuts down
-gracefully. Shell form wraps in `/bin/sh -c`, signals go to the shell wrapper
-and may never reach gunicorn.
 
 ---
 
-## 8. Environment Variables Strategy
+## 10. Multiple Dockerfiles — When and Why
+
+A project has ONE Dockerfile per **independently built service**.
+The PostgreSQL database always uses the official `postgres` image — no
+Dockerfile needed for it.
+
+| Architecture | Dockerfiles needed | File names |
+|---|---|---|
+| 2-tier (Flask + PostgreSQL) | 1 | `Dockerfile` |
+| 2-tier + Nginx frontend | 2 | `Dockerfile`, `Dockerfile.frontend` |
+| 3-tier (React + Flask + PostgreSQL) | 2 | `Dockerfile` (Flask), `Dockerfile.frontend` (React/Nginx) |
+
+**How compose.yml references multiple Dockerfiles:**
+```yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile           # Flask backend
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend  # Nginx or React build
+
+  db:
+    image: postgres:16-alpine          # No Dockerfile — uses official image
+```
+
+---
+
+## 11. Approach A — Single Container (This Project)
+
+This is the correct approach for **2-tier apps** where Flask serves both
+the business logic and the HTML templates (Jinja2).
+
+```
+Containers:  flask-app  ←→  postgres-db
+Dockerfiles: 1 (Dockerfile)
+```
+
+**`Dockerfile`** (see full file in project root)
+
+**`compose.yml`:**
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: postgres-db
+    ...
+
+  app:
+    build: .
+    container_name: flask-app
+    ports:
+      - "${PORT:-5000}:5000"
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+**When to use:**
+- Flask app uses Jinja2 templates
+- No separate JavaScript frontend framework
+- Static files (CSS/JS) are served directly by Flask
+- Project is 2-tier
+
+---
+
+## 12. Approach B — Separate Nginx Frontend Container
+
+Use this when you want to serve static files (HTML/CSS/JS) from a dedicated
+Nginx container, while Flask handles only backend logic.
+This makes sense even for 2-tier apps when you want a proper web server in front.
+
+```
+Containers:  nginx-frontend  →  flask-app  →  postgres-db
+Dockerfiles: 2 (Dockerfile + Dockerfile.frontend)
+```
+
+**`Dockerfile.frontend`:**
+```dockerfile
+# Serve static files and proxy API requests to Flask
+FROM nginx:alpine
+
+# Copy static HTML/CSS into Nginx's web root
+COPY ./app/static /usr/share/nginx/html/static
+COPY ./app/templates /usr/share/nginx/html
+
+# Copy custom Nginx config to proxy /api requests to Flask
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+```
+
+**`nginx.conf`:**
+```nginx
+server {
+    listen 80;
+
+    # Serve static files directly
+    location /static/ {
+        root /usr/share/nginx/html;
+    }
+
+    # Proxy all other requests to Flask
+    location / {
+        proxy_pass http://app:5000;   # 'app' = Flask service name on Docker network
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+**`compose.yml`:**
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: postgres-db
+    ...
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flask-app
+    # No ports exposed to host — Nginx is the only entry point
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: nginx-frontend
+    ports:
+      - "80:80"       # Only Nginx is publicly accessible
+    depends_on:
+      - app
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+**When to use:**
+- You want Nginx handling SSL termination, compression, and static file caching
+- You want Flask to be completely private (not exposed to the internet directly)
+- You are moving towards a production-grade deployment
+
+---
+
+## 13. Approach C — Full 3-Tier with React Frontend
+
+Use this when the frontend is a completely separate JavaScript project
+(React, Vue.js, Angular) and Flask serves only a REST API.
+
+```
+Containers:  react-app (Nginx)  →  flask-api  →  postgres-db
+Dockerfiles: 2 (Dockerfile for Flask, Dockerfile.frontend for React build)
+```
+
+**Project structure for 3-tier:**
+```
+project/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── models.py
+│   │   └── routes.py        ← returns jsonify(), no render_template()
+│   ├── config.py
+│   ├── run.py
+│   └── Dockerfile
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   └── App.jsx
+│   ├── public/index.html
+│   ├── package.json
+│   └── Dockerfile.frontend
+└── compose.yml
+```
+
+**`Dockerfile.frontend` (React multi-stage build):**
+```dockerfile
+# Stage 1: Build the React app
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json .
+RUN npm ci                      # Install dependencies
+COPY . .
+RUN npm run build               # Produces /app/dist or /app/build
+
+# Stage 2: Serve the built files with Nginx
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+**Flask `routes.py` in 3-tier — returns JSON only:**
+```python
+from flask import jsonify
+
+@app.route('/api/items')
+def get_items():
+    items = Item.query.all()
+    return jsonify([{'id': i.id, 'name': i.name} for i in items])  # JSON, not HTML
+```
+
+**`compose.yml`:**
+```yaml
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: postgres-db
+    ...
+
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: flask-api
+    # Not exposed to host — only frontend talks to it
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.frontend
+    container_name: react-app
+    ports:
+      - "80:80"    # Only frontend is publicly exposed
+    depends_on:
+      - app
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+**When to use:**
+- Project has a React/Vue/Angular frontend in a separate folder
+- Flask returns only JSON — no `render_template()` anywhere
+- Frontend and backend need to scale independently
+- Modern microservices or SPA architecture
+
+---
+
+## 14. Environment Variables Strategy
 
 ### The Single .env File Rule
 
@@ -255,10 +693,10 @@ The only value that changes between bare-metal and Docker is the database host
 
 ### How Each Tool Reads .env
 
-| Tool | Reads .env? | Expands `${VAR}`? |
-|---|---|---|
-| `python-dotenv` (bare-metal) | ✅ Yes | ❌ No — write literal values |
-| `docker compose` | ✅ Yes | ✅ Yes — `${VAR}` works |
+| Tool | Reads .env? | Expands `${VAR}`? | Write values as |
+|---|---|---|---|
+| `python-dotenv` (bare-metal) | ✅ Yes | ❌ No | Literal values only |
+| `docker compose` | ✅ Yes | ✅ Yes | Literal OR `${VAR}` both work |
 
 ### The DATABASE_URL Override Pattern
 
@@ -270,33 +708,43 @@ compose.yml app service:
   environment:
     DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
                                                               ↑
-                                                  'db' = Docker service name
-                                                  resolved as hostname on app-network
+                                              'db' = Docker service name
+                                              resolved as hostname on app-network
 ```
 
 `compose.yml`'s `environment` block **overrides** the value from `env_file`.
 So `.env` always stays with `localhost` — you never need to change it when
 switching between bare-metal and Docker Compose.
 
+### env_file vs environment — The Difference
+
+```yaml
+app:
+  env_file: .env          # Loads ALL variables from .env into the container
+  environment:            # Overrides specific variables — takes priority over env_file
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+```
+
+- `env_file` = bulk loader — loads everything
+- `environment` = surgical override — changes only specific values
+- When both are present, `environment` wins for any key that appears in both
+
 ### Why Not Hardcode Credentials in Code?
 
-Hardcoded credentials:
-- Get committed to Git → exposed publicly if repo is public
+- Hardcoded credentials get committed to Git → exposed publicly if repo is public
 - Cannot be changed without rebuilding the image
 - Differ between environments (dev/staging/prod) — hardcoding forces separate images
 
-Environment variables solve all three problems.
-
 ---
 
-## 9. docker compose
+## 15. docker compose
 
 `docker compose` orchestrates multiple containers as a single application stack.
 Without it, you would need to:
-1. Create a network manually
-2. Start the PostgreSQL container manually
+1. Create a network manually: `docker network create app-network`
+2. Start PostgreSQL manually: `docker run --network app-network postgres:16-alpine`
 3. Wait for PostgreSQL to be ready manually
-4. Start the Flask container manually with the correct network and env vars
+4. Start Flask manually with all the correct env vars and network flags
 
 `compose.yml` automates all of this with one command: `docker compose up`.
 
@@ -309,13 +757,30 @@ app:
       condition: service_healthy
 ```
 
-This tells Docker Compose: do not start `app` until `db` passes its healthcheck.
-Without this, `app` would start immediately and crash trying to connect to a
-PostgreSQL server that hasn't finished initializing yet.
+`depends_on` without `condition` only waits for the container to **start**,
+not for PostgreSQL to be **ready to accept connections**. Always use
+`condition: service_healthy` with a proper healthcheck.
+
+### container_name — Why Explicit Names Matter
+
+```yaml
+app:
+  container_name: flask-app
+db:
+  container_name: postgres-db
+```
+
+Without `container_name`, Docker Compose generates names like
+`python-monolith-app-app-1`. With explicit names:
+```bash
+docker logs flask-app        # clean, memorable
+docker exec -it flask-app bash
+docker exec -it postgres-db psql -U myuser -d mydb
+```
 
 ---
 
-## 10. Networking
+## 16. Networking
 
 ```yaml
 networks:
@@ -323,27 +788,33 @@ networks:
     driver: bridge
 ```
 
-By default, Docker Compose creates a default network for all services in the file.
-Defining an **explicit named network** is better practice because:
-- It is visible in `docker network ls` with a recognizable name
-- In multi-compose setups, default networks can conflict
-- It makes the intent clear in the file
+By default, Docker Compose creates a default network for all services.
+Defining an **explicit named network** is better practice:
+- Visible in `docker network ls` with a recognizable name
+- In multi-compose setups, default networks can conflict with each other
+- Makes intent clear in the file
 
 **How container DNS works:**
 Inside `app-network`, each service is reachable by its **service name** as a hostname.
-So `db` in the connection URL resolves to the IP address of the `postgres-db` container.
-This is why `DATABASE_URL` uses `@db:5432` inside Docker — not `@localhost:5432`.
 
 ```
-flask-app container:  DATABASE_URL=postgresql://user:pass@db:5432/mydb
-                                                            ↑
-                                           Docker DNS resolves 'db'
-                                           to postgres-db container's IP
+Service name in compose.yml → hostname inside Docker network
+
+  db    → resolves to postgres-db container's IP
+  app   → resolves to flask-app container's IP
+
+flask-app:  DATABASE_URL=postgresql://user:pass@db:5432/mydb
+                                                  ↑
+                                Docker DNS resolves 'db'
+                                to postgres-db container's IP
 ```
+
+This is why `DATABASE_URL` uses `@db:5432` inside Docker — not `@localhost:5432`.
+`localhost` inside a container refers to the container itself, not other containers.
 
 ---
 
-## 11. Healthchecks
+## 17. Healthchecks
 
 ```yaml
 healthcheck:
@@ -353,10 +824,6 @@ healthcheck:
   retries: 5
   start_period: 10s
 ```
-
-`depends_on` alone only waits for the container to **start** — not for the
-process inside it to be **ready**. PostgreSQL takes a few seconds to initialize
-its data directory and start accepting connections.
 
 `pg_isready` is a PostgreSQL utility that checks if the server is accepting
 connections. The healthcheck runs it every 5 seconds.
@@ -368,67 +835,69 @@ connections. The healthcheck runs it every 5 seconds.
 | `retries: 5` | After 5 consecutive failures, mark container as `unhealthy` |
 | `start_period: 10s` | Give PostgreSQL 10 seconds to initialize before failures start counting |
 
-`start_period` prevents false `unhealthy` status during first boot when PostgreSQL
-is initializing its data directory — a process that can take several seconds.
+`start_period` prevents false `unhealthy` status on first boot — PostgreSQL
+takes several seconds to initialize its data directory before it can accept connections.
 
 ---
 
-## 12. Volumes
+## 18. Volumes
 
 ```yaml
 volumes:
   postgres_data:
     driver: local
+
+services:
+  db:
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
 ```
 
-```yaml
-db:
-  volumes:
-    - postgres_data:/var/lib/postgresql/data
-```
-
-PostgreSQL stores all database files in `/var/lib/postgresql/data` inside the
-container. Without a volume, all data is lost when the container is removed.
-
-A **named volume** persists data on the Docker host. Docker manages its location.
+PostgreSQL stores all database files in `/var/lib/postgresql/data`.
+Without a volume, all data is lost when the container is removed.
 
 | Command | Effect on volume |
 |---|---|
-| `docker compose down` | Stops containers, removes containers — **volume survives** |
-| `docker compose down -v` | Stops containers, removes containers AND volumes — **data is gone** |
+| `docker compose down` | Stops + removes containers — **volume survives** |
+| `docker compose down -v` | Stops + removes containers AND volumes — **data is gone** |
 | `docker compose up` | Reuses existing volume — data from previous run is restored |
+| `docker volume ls` | Lists all volumes |
+| `docker volume rm <name>` | Manually removes a volume |
 
 ---
 
-## 13. .dockerignore
+## 19. .dockerignore
 
-`.dockerignore` tells Docker which files NOT to copy into the image via `COPY . .`.
+`.dockerignore` tells Docker which files NOT to include in the build context
+when `COPY . .` is executed.
 
 ```
-.env              ← NEVER copy — contains secrets
-.git/             ← Version control metadata — not needed at runtime  
+.env              ← NEVER copy — contains secrets, baked into image layers
+.git/             ← Version control metadata — not needed at runtime
 __pycache__/      ← Python bytecode cache — rebuilt inside container
-*.pyc             ← Compiled Python files — platform-specific, regenerated
+*.pyc             ← Compiled Python files — platform-specific
 venv/             ← Local virtual environment — replaced by /opt/venv in image
 .pytest_cache/    ← Test artifacts — not needed at runtime
-tests/            ← Test code — not needed at runtime
+tests/            ← Test code — not needed in production image
+*.md              ← Documentation — not needed at runtime
+docs/             ← Documentation folder — not needed at runtime
 ```
 
-**The most important entry is `.env`** — it contains credentials. If it were
-copied into the image, those credentials would be baked into every layer and
-visible to anyone who pulls the image.
+**The most critical entry is `.env`** — if it were copied into the image,
+credentials would be baked into every layer and visible to anyone who pulls
+the image with `docker history` or `docker inspect`.
 
-Docker Compose passes `.env` values at **runtime** via `env_file` — the file
-itself never needs to be inside the image.
+Docker Compose passes `.env` values at **runtime** via `env_file` — the
+file never needs to be inside the image.
 
 ---
 
-## 14. The SQLAlchemy Pitfall — Duplicate db Instances
+## 20. The SQLAlchemy Pitfall — Duplicate db Instances
 
-This is a subtle but critical Flask + SQLAlchemy mistake that only surfaces
-when running under gunicorn (multi-worker) — not during development.
+This bug is invisible during development (`python run.py`) but crashes
+immediately under gunicorn's multi-worker process model.
 
-**The wrong pattern:**
+**The wrong pattern — two separate db objects:**
 ```python
 # app/models.py
 from flask_sqlalchemy import SQLAlchemy
@@ -436,84 +905,91 @@ db = SQLAlchemy()          # Instance A
 
 # app/__init__.py
 from flask_sqlalchemy import SQLAlchemy
-db = SQLAlchemy()          # Instance B  ← second, separate object
+db = SQLAlchemy()          # Instance B  ← second, separate object!
 
 def create_app():
-    db.init_app(app)       # registers Instance B with the Flask app
+    db.init_app(app)       # registers Instance B with the app
 
 # app/routes.py
-from .models import db     # imports Instance A — never registered!
+from .models import db     # imports Instance A — never registered with app!
 items = Item.query.all()   # RuntimeError!
 ```
 
-**The error:**
+**The error you will see:**
 ```
 RuntimeError: The current Flask app is not registered with this 'SQLAlchemy' instance.
 Did you forget to call 'init_app', or did you create multiple 'SQLAlchemy' instances?
 ```
 
-**The correct pattern — one source of truth:**
+**The correct pattern — single source of truth:**
 ```python
 # app/models.py
 from flask_sqlalchemy import SQLAlchemy
-db = SQLAlchemy()          # ONE instance, defined here
+db = SQLAlchemy()          # ONE instance — defined here, imported everywhere else
 
 # app/__init__.py
-from app.models import db  # import the SAME instance
+from app.models import db  # import the SAME instance — do NOT create a new one
 
 def create_app():
-    db.init_app(app)       # registers the same db that routes.py uses ✅
+    db.init_app(app)       # now routes.py and __init__.py share the same db ✅
 
 # app/routes.py
 from .models import db     # same instance — already registered ✅
 ```
 
-**Rule:** `db = SQLAlchemy()` must appear **exactly once** in the entire codebase.
-Everyone else imports it from `models.py`.
+**Rule:** `db = SQLAlchemy()` must appear **exactly once** in the codebase.
 
 ---
 
-## 15. Mental Model — Bare-Metal vs Docker Compose
+## 21. Mental Model — Bare-Metal vs Docker Compose
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        BARE-METAL                                │
 │                                                                  │
-│  Terminal                                                        │
 │  $ python run.py                                                 │
 │                                                                  │
-│  python-dotenv reads .env                                        │
+│  python-dotenv reads .env directly                               │
 │  DATABASE_URL = postgresql://user:pass@localhost:5432/db  ✅     │
-│  PostgreSQL running on your machine at localhost          ✅     │
+│  PostgreSQL must be running on your machine at localhost          │
+│  python-dotenv does NOT expand ${...} — literal values only      │
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                      DOCKER COMPOSE                              │
 │                                                                  │
-│  Terminal                                                        │
 │  $ docker compose up --build                                     │
 │                                                                  │
-│  compose.yml loads .env via env_file                             │
-│  compose.yml overrides DATABASE_URL in app service:              │
-│  DATABASE_URL = postgresql://user:pass@db:5432/mydb       ✅     │
+│  Step 1: compose.yml loads .env via env_file                     │
+│  Step 2: compose.yml OVERRIDES DATABASE_URL in app service:      │
+│          DATABASE_URL = postgresql://user:pass@db:5432/mydb ✅   │
 │                                              ↑                   │
-│                              Docker DNS resolves 'db'            │
-│                              to postgres-db container            │
+│                          Docker DNS resolves 'db' to             │
+│                          postgres-db container's IP              │
 │                                                                  │
-│  .env value (@localhost) is IGNORED for the app container ✅     │
+│  Result: .env value (@localhost) is IGNORED for app container    │
+│  compose.yml DOES expand ${...} — both literal and ${VAR} work   │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+**The key insight:**
+You never need to change `.env` when switching between bare-metal and Docker.
+Docker Compose handles the `localhost` → `db` substitution automatically
+through the `environment` override block in `compose.yml`.
+
 ---
 
-## 16. Quick Reference — Commands
+## 22. Quick Reference — Commands
 
 ```bash
+# ── Setup ──────────────────────────────────────────────────────────────────
+cp .env.example .env           # Create your .env from the template
+
 # ── Build & Run ────────────────────────────────────────────────────────────
 docker compose up --build          # Build images and start all services
 docker compose up -d --build       # Same but in detached (background) mode
 docker compose down                # Stop and remove containers
-docker compose down -v             # Stop, remove containers AND volumes (data gone)
+docker compose down -v             # Stop, remove containers AND volumes
 
 # ── Logs ───────────────────────────────────────────────────────────────────
 docker compose logs app            # View app logs
@@ -524,13 +1000,16 @@ docker compose logs -f app         # Follow (tail) app logs in real time
 docker compose ps                  # Check container status and health
 docker exec -it flask-app bash     # Shell into the running app container
 docker exec -it postgres-db bash   # Shell into the running db container
+docker exec -it postgres-db psql -U <user> -d <db>  # Connect to PostgreSQL
 docker network ls                  # List all Docker networks
+docker network inspect app-network # Inspect the app network
 docker volume ls                   # List all Docker volumes
 
 # ── Image ──────────────────────────────────────────────────────────────────
 docker build -t flask-app .        # Build image manually (without compose)
 docker image ls                    # List local images
 docker image rm flask-app          # Remove image
+docker history flask-app           # Inspect image layers
 
 # ── Rebuild after code changes ─────────────────────────────────────────────
 git pull
