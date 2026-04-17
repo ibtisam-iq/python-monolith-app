@@ -1,6 +1,6 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Docker Compose — local development and integration testing stack.
-# Production deployments should use Kubernetes or a managed platform.
+# Docker Compose — Local Development Environment
+# For production deployments, see: platform-engineering-systems repo
 #
 # Usage:
 #   docker compose up --build          # Build and start both services
@@ -26,16 +26,16 @@ services:
     # The PostgreSQL image specifically looks for POSTGRES_USER, POSTGRES_PASSWORD,
     # and POSTGRES_DB to initialize the database on first startup.
     env_file: .env
+
+    # ── REDUNDANT BLOCK (kept for documentation purposes only) ──
+    # These three variables below are already loaded by env_file: .env above.
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    # NOTE: env_file alone would work here since the variable names match exactly
-    # what the postgres image expects. The explicit 'environment' block above is
-    # kept for clarity — it makes the required variables visible without opening .env.
+      POSTGRES_USER: ${POSTGRES_USER}             # redundant — already loaded by env_file
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}     # redundant — already loaded by env_file
+      POSTGRES_DB: ${POSTGRES_DB}                 # redundant — already loaded by env_file
 
     volumes:
-      - postgres_data:/var/lib/postgresql/data  # Persists across restarts; removed only with 'down -v'
+      - postgres_data:/var/lib/postgresql/data    # Persists across restarts; removed only with 'down -v'
 
     healthcheck:
       # pg_isready checks if PostgreSQL is accepting connections.

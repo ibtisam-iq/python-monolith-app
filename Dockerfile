@@ -1,4 +1,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
+# Build context = python-monolith-app/ (repo root)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Stage 1 — Builder
 # Installs all Python dependencies into an isolated virtual environment.
 # This stage is discarded after the build — no build tools leak into the final image.

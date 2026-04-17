@@ -2,6 +2,7 @@
 .git
 .gitignore
 .gitattributes
+.gitmodules
 
 # Python
 __pycache__
@@ -13,17 +14,32 @@ venv
 dist
 build
 
-# Environment — NEVER bake secrets into the image
-.env
-
-# Tests — not needed in the production image
+# Tests
 tests/
 
-# Editor and OS artifacts
-.vscode
-.idea
-*.DS_Store
+# IDE and editor files
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.DS_Store
 
-# README and docs
+# Environment files — NEVER bake secrets into images
+.env
+.env.*
+!.env.example            # Exception: allow the example template (no real secrets)
+
+# Docker files themselves (not needed inside the image)
+Dockerfile
+compose.yml
+.dockerignore
+
+# Documentation and assets (not needed at runtime)
 README.md
-images/
+docs/
+assets/
+.scratchpad/
+
+# Test and coverage reports
+*.log
