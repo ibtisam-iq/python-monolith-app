@@ -28,14 +28,15 @@ WORKDIR /app
 # Copy the virtual environment from the builder stage
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy application source code
-COPY . .
+# Copy application source code and set ownership in one layer
+# chown at COPY time avoids a separate RUN chown layer (which would double the layer size)
+COPY --chown=appuser:appgroup . .
 
 # Ensure the venv binaries take priority over system Python
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Environment variables with safe defaults.
-# DATABASE_URL must be injected at runtime via --env-file or compose.yml — never hardcoded.
+# Default port — override at runtime via .env or compose.yml environment block.
+# DATABASE_URL must be injected at runtime — never hardcoded here.
 ENV PORT=5000
 
 # Drop to non-root user before starting the process
@@ -44,7 +45,15 @@ USER appuser
 # Expose the port the app listens on
 EXPOSE 5000
 
+# Health check — calls /health endpoint added in routes.py.
+# start_period gives the app time to connect to the database before failures count.
+# Kubernetes uses its own liveness/readiness probes — this is for Docker and Compose.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
+    || exit 1
+
 # Production entrypoint: gunicorn serves the Flask app.
-# 'run:app' refers to the 'app' object created in run.py.
 # Workers = (2 x CPU cores) + 1 is the standard formula; 3 is a safe default for containers.
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "3", "--timeout", "120", "run:app"]
+# PORT is read from the environment — falls back to 5000 if not set.
+# Shell form (sh -c) is required here so the ${PORT} variable is expanded at runtime.
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 3 --timeout 120 run:app"]

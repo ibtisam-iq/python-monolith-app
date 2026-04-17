@@ -12,6 +12,8 @@
 # Before running: ensure .env exists with real values (cp .env.example .env)
 # ──────────────────────────────────────────────────────────────────────────────
 
+name: python-monolith-app
+
 services:
 
   # ── PostgreSQL Database ─────────────────────────────────────────────────────
@@ -53,6 +55,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: python-monolith-app
     container_name: flask-app
     restart: unless-stopped
 
@@ -72,9 +75,19 @@ services:
 
     ports:
       # HOST_PORT:CONTAINER_PORT
-      # Container always listens on 5000 (hardcoded in Dockerfile CMD and EXPOSE).
+      # Container always listens on PORT (default 5000, set in Dockerfile ENV and .env).
       # Host port comes from .env — defaults to 5000 if PORT is not set.
-      - "${PORT:-5000}:5000"
+      - "${PORT:-5000}:${PORT:-5000}"
+
+    healthcheck:
+      # Calls the /health endpoint added to routes.py.
+      # Returns 200 if the app is running and the database is reachable.
+      # start_period gives the app time to connect to PostgreSQL after startup.
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
     depends_on:
       db:

@@ -1,12 +1,29 @@
-from flask import Blueprint, render_template, request, redirect, url_for
+from flask import Blueprint, render_template, request, redirect, url_for, jsonify
 from .models import db, Item
 
 main = Blueprint('main', __name__)
+
+
+@main.route('/health')
+def health():
+    """
+    Liveness/readiness probe endpoint.
+    Used by Docker HEALTHCHECK, Kubernetes liveness and readiness probes,
+    and docker compose healthcheck.
+    Returns 200 OK if the app is running and the database is reachable.
+    """
+    try:
+        db.session.execute(db.text('SELECT 1'))
+        return jsonify(status='healthy', database='reachable'), 200
+    except Exception as e:
+        return jsonify(status='unhealthy', error=str(e)), 503
+
 
 @main.route('/')
 def index():
     items = Item.query.all()
     return render_template('index.html', items=items)
+
 
 @main.route('/create', methods=['GET', 'POST'])
 def create():
@@ -20,10 +37,12 @@ def create():
             return redirect(url_for('main.index'))
     return render_template('create.html')
 
+
 @main.route('/view/<int:item_id>')
 def view_item(item_id):
     item = Item.query.get_or_404(item_id)
     return render_template('view.html', item=item)
+
 
 @main.route('/edit/<int:item_id>', methods=['GET', 'POST'])
 def edit_item(item_id):
@@ -35,10 +54,10 @@ def edit_item(item_id):
         return redirect(url_for('main.index'))
     return render_template('edit.html', item=item)
 
+
 @main.route('/delete/<int:item_id>')
 def delete_item(item_id):
     item = Item.query.get_or_404(item_id)
     db.session.delete(item)
     db.session.commit()
     return redirect(url_for('main.index'))
-
