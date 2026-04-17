@@ -159,7 +159,7 @@ With the application validated on bare metal, I wrote the `Dockerfile` and `comp
 
 **Key decisions I made and documented:**
 
-- Multi-stage build to keep the runtime image lean (~120MB vs ~900MB)
+- Multi-stage build to keep the runtime image lean (~62MB vs ~900MB)
 - Non-root user for CIS/Trivy compliance
 - Gunicorn as the production WSGI server (replaces Flask's dev server)
 - `exec gunicorn` as PID 1 for clean signal handling in containers
