@@ -40,12 +40,13 @@ services:
     healthcheck:
       # pg_isready checks if PostgreSQL is accepting connections.
       # The app service will not start until this check passes (see depends_on below).
-      # start_period: gives PostgreSQL time to initialize before failures start counting.
+      # start_period=20s: PostgreSQL first-startup (initdb + database creation) can take
+      # 15-25s — 10s was too short and caused premature healthcheck failures.
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 10s
+      start_period: 20s
 
     networks:
       - app-network
@@ -75,19 +76,21 @@ services:
 
     ports:
       # HOST_PORT:CONTAINER_PORT
-      # Container always listens on PORT (default 5000, set in Dockerfile ENV and .env).
-      # Host port comes from .env — defaults to 5000 if PORT is not set.
+      # Both sides use ${PORT:-5000} so they always match — even if PORT is changed in .env.
+      # Previously the comment incorrectly said "container always listens on 5000" —
+      # the container listens on whatever PORT is set to (default 5000).
       - "${PORT:-5000}:${PORT:-5000}"
 
     healthcheck:
       # Calls the /health endpoint added to routes.py.
       # Returns 200 if the app is running and the database is reachable.
-      # start_period gives the app time to connect to PostgreSQL after startup.
+      # start_period=40s: Flask + SQLAlchemy + PostgreSQL connection pool cold start
+      # can take 20-40s — consistent with Dockerfile HEALTHCHECK start_period.
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 40s
 
     depends_on:
       db:

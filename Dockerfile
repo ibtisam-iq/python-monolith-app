@@ -23,11 +23,26 @@ RUN python -m venv /opt/venv \
 # ──────────────────────────────────────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
+# OCI standard image labels
+LABEL org.opencontainers.image.title="PythonMonolithApp" \
+      org.opencontainers.image.description="Flask Student Management Application" \
+      org.opencontainers.image.authors="Muhammad Ibtisam Iqbal <github.com/ibtisam-iq>" \
+      org.opencontainers.image.source="https://github.com/ibtisam-iq/python-monolith-app" \
+      org.opencontainers.image.licenses="MIT"
+
 # Create a non-root user — running as root inside a container is a security risk
+# flagged by Trivy (HIGH/CRITICAL) and rejected by Kubernetes PodSecurityAdmission
 RUN groupadd --gid 1001 appgroup \
     && useradd --uid 1001 --gid appgroup --no-create-home appuser
 
 WORKDIR /app
+
+# Standard Python container flags:
+# PYTHONDONTWRITEBYTECODE=1 — prevents .pyc files (smaller image, no stale bytecode)
+# PYTHONUNBUFFERED=1        — forces real-time stdout/stderr flushing for docker logs
+#                             and Kubernetes log aggregators
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 # Copy the virtual environment from the builder stage
 COPY --from=builder /opt/venv /opt/venv
@@ -39,21 +54,26 @@ COPY --chown=appuser:appgroup . .
 # Ensure the venv binaries take priority over system Python
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Default port — override at runtime via .env or compose.yml environment block.
+# PORT is read from the environment at runtime via .env or compose.yml.
+# Default 5000 is the fallback — never hardcode a specific value here.
 # DATABASE_URL must be injected at runtime — never hardcoded here.
-ENV PORT=5000
+ARG PORT=5000
+ENV PORT=${PORT}
 
 # Drop to non-root user before starting the process
 USER appuser
 
-# Expose the port the app listens on
-EXPOSE 5000
+# EXPOSE reads the PORT build arg — not hardcoded to 5000.
+# This keeps EXPOSE honest: it reflects the actual port the container listens on.
+EXPOSE ${PORT}
 
 # Health check — calls /health endpoint added in routes.py.
-# start_period gives the app time to connect to the database before failures count.
+# CMD-SHELL is used explicitly so ${PORT:-5000} is expanded by the shell at runtime.
+# start_period=40s: Flask + SQLAlchemy + PostgreSQL connection pool cold start
+# can take 20-40s — 40s gives ample grace without being excessive.
 # Kubernetes uses its own liveness/readiness probes — this is for Docker and Compose.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD-SHELL python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
     || exit 1
 
 # Production entrypoint: gunicorn serves the Flask app.
