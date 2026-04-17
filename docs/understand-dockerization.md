@@ -90,7 +90,7 @@ Before writing a Dockerfile for ANY Python project, answer these questions:
 | Database | PostgreSQL |
 | Build tools needed | None — psycopg2-binary is pre-compiled |
 | Start command | `gunicorn run:app` in production |
-| Port | 5000 |
+| Port | 5000 (configurable via `PORT` env var) |
 | Config needed | `DATABASE_URL`, `PORT` |
 | Frontend type | Jinja2 templates (integrated — same container as Flask) |
 | Architecture | 2-tier |
@@ -268,12 +268,31 @@ changed. This makes rebuilds significantly faster.
 `--no-cache-dir` tells pip not to cache downloaded packages — reduces image size.
 
 ```dockerfile
-COPY . .
+COPY --chown=appuser:appgroup . .
 ```
 
-Copies all remaining application files. This layer changes every time your code
-changes — but because it comes AFTER the pip install layer, dependency installation
-is still cached.
+Copies all remaining application files AND sets ownership to `appuser:appgroup`
+in a single layer.
+
+**Why `--chown` at `COPY` time instead of a separate `RUN chown` layer?**
+
+The naive approach uses two steps:
+```dockerfile
+COPY . .                              # Layer 1 — files copied, owned by root
+RUN chown -R appuser:appgroup /app    # Layer 2 — ownership changed
+```
+This doubles the layer size because Docker stores BOTH the original root-owned
+copy AND the re-owned copy in separate layers. The image ends up carrying the
+data twice.
+
+The correct approach:
+```dockerfile
+COPY --chown=appuser:appgroup . .     # Single layer — copied AND owned correctly
+```
+One layer, correct ownership from the start, no size penalty.
+
+> **Important:** `appuser` must be created with `RUN groupadd / useradd` BEFORE
+> this `COPY` instruction. You cannot `--chown` to a user that doesn't exist yet.
 
 ---
 
@@ -301,7 +320,7 @@ COPY . .
 **`--prefix=/install`** installs packages into `/install` instead of the
 system Python. This isolates them so Stage 2 can copy them cleanly.
 
-**Alternative — virtual environment approach:**
+**Alternative — virtual environment approach (used in this project):**
 ```dockerfile
 # Stage 1
 FROM python:3.12-slim AS builder
@@ -316,7 +335,7 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY --from=builder /opt/venv /opt/venv   # ← copy entire venv
 ENV PATH="/opt/venv/bin:$PATH"
-COPY . .
+COPY --chown=appuser:appgroup . .
 ```
 
 Both approaches achieve the same goal. The venv approach is more explicit and
@@ -365,11 +384,11 @@ Install NOTHING extra. The binary bundles everything it needs.
 
 ---
 
-## 8. Non-Root User
+## 8. Non-Root User — Security Inside Containers
 
 ```dockerfile
-RUN groupadd --system appgroup && useradd --system --gid appgroup appuser
-USER appuser
+RUN groupadd --gid 1001 appgroup \
+    && useradd --uid 1001 --gid appgroup --no-create-home appuser
 ```
 
 By default, processes inside Docker containers run as `root`. This is dangerous:
@@ -387,16 +406,45 @@ the container — and potentially to the host.
 
 Using Alpine syntax on a Debian image (or vice versa) will fail.
 
-**`--system` flag** creates a system account with no home directory, no shell,
-and no login — appropriate for service accounts running application processes.
+**Explicit UID/GID (`--uid 1001 --gid 1001`) vs `--system`:**
+
+| Flag | UID assigned | Use when |
+|---|---|---|
+| `--system` | Auto-assigned (low number, e.g. 999) | Simple cases, UID doesn't matter |
+| `--uid 1001 --gid 1001` | Explicitly fixed | Kubernetes (Pod Security, volume ownership), rootless Docker |
+
+This project uses explicit `1001` so the UID is predictable and stable across
+environments. Kubernetes volume mounts and `securityContext.runAsUser` depend on
+a known, fixed UID.
+
+**`--no-create-home`** skips creating a home directory — this is a service
+account, not an interactive user. Keeps the image minimal.
+
+### Ownership — `COPY --chown` vs `RUN chown`
+
+```dockerfile
+# ❌ Wrong — doubles the layer size
+COPY . .
+RUN chown -R appuser:appgroup /app
+
+# ✅ Correct — single layer, ownership set at copy time
+COPY --chown=appuser:appgroup . .
+```
+
+See Section 5 for the full explanation of why `--chown` at `COPY` time is always
+preferred over a separate `RUN chown` layer.
+
+```dockerfile
+# Always switch to non-root user as the last step before CMD/ENTRYPOINT
+USER appuser
+```
+
+Everything after `USER appuser` — including `EXPOSE`, `HEALTHCHECK`, `CMD` —
+runs as the non-root user.
 
 ---
 
-## 9. gunicorn
-
-```dockerfile
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "3", "--timeout", "120", "run:app"]
-```
+## 9. gunicorn — Why Not Flask's Built-in Server
 
 Flask has a built-in development server (`flask run`). **Never use it in production.**
 It is single-threaded, not designed for concurrent requests, and lacks stability.
@@ -406,25 +454,47 @@ It is single-threaded, not designed for concurrent requests, and lacks stability
 - Manages worker lifecycle (restarts crashed workers)
 - Integrates with Nginx as a reverse proxy
 
+### exec form vs shell form — A Critical Distinction
+
+```dockerfile
+# Exec form — signals go directly to gunicorn — port is HARDCODED
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "3", "--timeout", "120", "run:app"]
+
+# Shell form — required when environment variable expansion is needed
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 3 --timeout 120 run:app"]
+```
+
+**Why exec form does NOT support `$PORT`:**
+In exec form, Docker passes the array directly to the kernel with `execve()` —
+no shell is involved, so `${PORT}` is passed as a literal string, not expanded.
+
+**Why this project uses shell form:**
+`PORT` is configurable via the `.env` file and the `compose.yml` environment block.
+If `PORT=8080` is set, the container must bind on `8080`. Using `sh -c` invokes
+a shell that expands `${PORT:-5000}` before passing it to gunicorn.
+
+The `:-5000` syntax is a shell default — if `PORT` is unset or empty, `5000` is used.
+
+**Signal handling note:**
+Shell form wraps the process in `sh -c`, which means `SIGTERM` (sent by
+`docker stop`) goes to `sh`, not directly to gunicorn. Gunicorn handles graceful
+shutdown correctly in this case because `sh` forwards the signal — but if you
+need zero-latency signal forwarding, use `exec gunicorn ...` inside the shell:
+
+```dockerfile
+CMD ["sh", "-c", "exec gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 3 --timeout 120 run:app"]
+```
+
+`exec` replaces the `sh` process with gunicorn — PID 1 becomes gunicorn directly.
+
+**gunicorn arguments explained:**
+
 | Argument | Meaning |
 |---|---|
-| `--bind 0.0.0.0:5000` | Listen on all network interfaces on port 5000 |
+| `--bind 0.0.0.0:${PORT:-5000}` | Listen on all interfaces, port from env (default 5000) |
 | `--workers 3` | Spawn 3 worker processes. Rule of thumb: `2 * CPU_cores + 1` |
 | `--timeout 120` | Kill workers that don't respond within 120 seconds |
 | `run:app` | Import the `app` object from `run.py` — `module:variable` format |
-
-**Why is port 5000 hardcoded?**
-CMD exec form does NOT expand `$PORT`. The container's internal port is always
-fixed. Host port is controlled in `compose.yml` via `"${PORT:-5000}:5000"`.
-
-**exec form vs shell form:**
-```dockerfile
-# Exec form — RECOMMENDED — signals go directly to gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "run:app"]
-
-# Shell form — NOT recommended — signals go to /bin/sh wrapper, not gunicorn
-CMD gunicorn --bind 0.0.0.0:${PORT:-5000} run:app
-```
 
 ---
 
@@ -483,7 +553,7 @@ services:
     build: .
     container_name: flask-app
     ports:
-      - "${PORT:-5000}:5000"
+      - "${PORT:-5000}:${PORT:-5000}"
     depends_on:
       db:
         condition: service_healthy
@@ -737,7 +807,7 @@ app:
 
 ---
 
-## 15. docker compose
+## 15. docker compose — Orchestrating Multiple Containers
 
 `docker compose` orchestrates multiple containers as a single application stack.
 Without it, you would need to:
@@ -747,6 +817,51 @@ Without it, you would need to:
 4. Start Flask manually with all the correct env vars and network flags
 
 `compose.yml` automates all of this with one command: `docker compose up`.
+
+### The `name:` Field — Compose Project Name
+
+```yaml
+name: python-monolith-app
+```
+
+Every Compose stack has a **project name**. Docker uses it to prefix all
+resources it creates — containers, networks, and volumes:
+
+```
+Without name:   directory name is used as prefix
+  e.g. on machine A:  myproject-app-1, myproject-app-network
+  e.g. on machine B:  python-monolith-app-app-1  (different directory name → different prefix)
+
+With name: python-monolith-app:
+  Always:       python-monolith-app-app-1, python-monolith-app-app-network
+```
+
+Setting `name:` explicitly guarantees consistent resource naming regardless
+of the directory the project is cloned into. This matters in CI/CD pipelines
+where workspace directories are auto-generated and unpredictable.
+
+### The `image:` Field on a Build Service
+
+```yaml
+app:
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: python-monolith-app     # ← explicit image name
+```
+
+When a service has both `build:` and `image:`, Docker Compose:
+1. Builds the image from the Dockerfile
+2. Tags the result as `python-monolith-app:latest`
+
+Without `image:`, the built image gets an auto-generated name like
+`python-monolith-app-app` — not suitable for pushing to a registry.
+With `image:`, you can push it directly:
+
+```bash
+docker compose build
+docker push python-monolith-app:latest    # works cleanly with an explicit name
+```
 
 ### Service Order — db First, app Second
 
@@ -814,15 +929,21 @@ This is why `DATABASE_URL` uses `@db:5432` inside Docker — not `@localhost:543
 
 ---
 
-## 17. Healthchecks
+## 17. Healthchecks — Why depends_on Alone is Not Enough
+
+Healthchecks operate at two levels in this project: the **database level** and
+the **application level**. Both are necessary for a production-grade setup.
+
+### Level 1 — Database Healthcheck (PostgreSQL)
 
 ```yaml
-healthcheck:
-  test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-  interval: 5s
-  timeout: 5s
-  retries: 5
-  start_period: 10s
+db:
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
 ```
 
 `pg_isready` is a PostgreSQL utility that checks if the server is accepting
@@ -838,9 +959,110 @@ connections. The healthcheck runs it every 5 seconds.
 `start_period` prevents false `unhealthy` status on first boot — PostgreSQL
 takes several seconds to initialize its data directory before it can accept connections.
 
+### Level 2 — Application Healthcheck (Flask)
+
+The application healthcheck works across three connected layers:
+
+**Layer 1 — The `/health` route in `app/routes.py`:**
+```python
+@main.route('/health')
+def health():
+    try:
+        db.session.execute(db.text('SELECT 1'))
+        return jsonify(status='healthy', database='reachable'), 200
+    except Exception as e:
+        return jsonify(status='unhealthy', error=str(e)), 503
+```
+
+This endpoint does a real database probe — not just a process check.
+It executes `SELECT 1` against PostgreSQL. If the query succeeds, the app
+is healthy. If it fails (network issue, DB crash, connection pool exhausted),
+it returns `503 Service Unavailable` with the error detail.
+
+**Why probe the database from the health endpoint?**
+A Flask process can be running (the Python interpreter is alive) but completely
+non-functional if the database connection is broken. A process-only check would
+report `healthy` while every user request fails. The DB probe catches this.
+
+**Layer 2 — `HEALTHCHECK` in the Dockerfile:**
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
+    || exit 1
+```
+
+| Parameter | Meaning |
+|---|---|
+| `--interval=30s` | Check every 30 seconds |
+| `--timeout=10s` | Fail if no response within 10 seconds |
+| `--start-period=30s` | Wait 30s after container starts before counting failures — gives Flask time to connect to PostgreSQL |
+| `--retries=3` | Mark as `unhealthy` after 3 consecutive failures |
+
+`python -c "import urllib.request; ..."` uses the standard library — no curl,
+no wget needed. This works in `python:3.12-slim` without installing anything extra.
+
+`${PORT:-5000}` expands inside the Dockerfile `HEALTHCHECK` because Docker
+evaluates it through the shell at runtime.
+
+**Layer 3 — `healthcheck` in `compose.yml` on the `app` service:**
+```yaml
+app:
+  healthcheck:
+    test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')\""]
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    start_period: 30s
+```
+
+The `compose.yml` healthcheck **overrides** the Dockerfile `HEALTHCHECK` for
+local development. Both call the same `/health` endpoint. The Compose version
+is useful because it shows real-time health status in `docker compose ps`:
+
+```bash
+$ docker compose ps
+NAME          IMAGE                  STATUS
+flask-app     python-monolith-app    Up (healthy)
+postgres-db   postgres:16-alpine     Up (healthy)
+```
+
+**The full dependency chain:**
+
+```
+postgres-db   → pg_isready passes     → status: healthy
+     ↓
+flask-app     → waits (condition: service_healthy)
+     ↓         → starts gunicorn
+               → connects to PostgreSQL
+               → /health returns 200  → status: healthy
+```
+
+**Kubernetes note:**
+In Kubernetes, the Dockerfile `HEALTHCHECK` is ignored. Kubernetes uses its own
+`livenessProbe` and `readinessProbe` — both should point to `/health`:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 30
+  periodSeconds: 30
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+```
+
+The `/health` endpoint added to `routes.py` serves Docker, Docker Compose,
+and Kubernetes — one endpoint, three consumers.
+
 ---
 
-## 18. Volumes
+## 18. Volumes — Persisting Database Data
 
 ```yaml
 volumes:
@@ -866,7 +1088,7 @@ Without a volume, all data is lost when the container is removed.
 
 ---
 
-## 19. .dockerignore
+## 19. .dockerignore — What NOT to Copy
 
 `.dockerignore` tells Docker which files NOT to include in the build context
 when `COPY . .` is executed.
@@ -996,8 +1218,11 @@ docker compose logs app            # View app logs
 docker compose logs db             # View database logs
 docker compose logs -f app         # Follow (tail) app logs in real time
 
-# ── Debug ──────────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────
 docker compose ps                  # Check container status and health
+curl http://localhost:5000/health  # Test the health endpoint manually
+
+# ── Debug ──────────────────────────────────────────────────────────────────
 docker exec -it flask-app bash     # Shell into the running app container
 docker exec -it postgres-db bash   # Shell into the running db container
 docker exec -it postgres-db psql -U <user> -d <db>  # Connect to PostgreSQL
@@ -1006,10 +1231,10 @@ docker network inspect app-network # Inspect the app network
 docker volume ls                   # List all Docker volumes
 
 # ── Image ──────────────────────────────────────────────────────────────────
-docker build -t flask-app .        # Build image manually (without compose)
-docker image ls                    # List local images
-docker image rm flask-app          # Remove image
-docker history flask-app           # Inspect image layers
+docker build -t python-monolith-app .   # Build image manually (without compose)
+docker image ls                         # List local images
+docker image rm python-monolith-app     # Remove image
+docker history python-monolith-app      # Inspect image layers
 
 # ── Rebuild after code changes ─────────────────────────────────────────────
 git pull
