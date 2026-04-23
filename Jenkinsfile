@@ -397,7 +397,6 @@ pipeline {
                             -r app/ \\
                             --severity-level high \\
                             --confidence-level medium \\
-                            --exit-zero=false \\
                             --quiet \\
                             --format txt || {
                                 echo '❌ Bandit found HIGH severity security issues. Fix before proceeding.'
