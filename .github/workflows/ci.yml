@@ -735,11 +735,15 @@ jobs:
       #   1. Hosted Docker repo with "Path based routing" selected
       #   2. Security → Realms → Docker Bearer Token Realm active
       # ──────────────────────────────────────────────────────
-      - name: Nexus — push image (path-based routing)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG
-          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
+
+      # Temporarily disabled: Docker push to Nexus fails due to Cloudflare 413 Payload Too Large 
+      # (image layer exceeds Cloudflare upload limit)
+      
+      # - name: Nexus — push image (path-based routing)
+      #  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #  run: |
+      #    docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG
+      #    docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
 
       # ──────────────────────────────────────────────────────
       # STAGE 15b — Push to AWS ECR  [PLANNED — commented out]
