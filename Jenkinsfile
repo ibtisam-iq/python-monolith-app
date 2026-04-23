@@ -9,8 +9,9 @@
 // ── REQUIRED JENKINS PLUGINS ──────────────────────────────────────────────────
 //   - SonarQube Scanner Plugin    → provides withSonarQubeEnv()
 //   - AnsiColor Plugin            → provides ansiColor() option
-//   - Cobertura Plugin            → provides coberturaPublisher / recordCoverage() DSL
+//   - Coverage Plugin             → provides recordCoverage() DSL
 //                                   for Python coverage.xml (Cobertura format)
+//                                   (replaces deprecated Cobertura Plugin)
 //   - JUnit Plugin                → provides junit() DSL for pytest XML reports
 //
 // NOTE: No Pipeline Maven Integration Plugin needed — this is Python, not Java.
@@ -608,7 +609,7 @@ pipeline {
         //   Python builds don't produce a compiled binary separable from its runtime.
         //   The venv IS the artifact — it must run on the same Python interpreter
         //   it was installed on. Using python:3.12-slim for both stages is correct
-        //   and produces ~180MB final image (vs ~600MB+ for the full Python image).
+        //   and produces ~180MB final image (vs ~500MB+ for the full Python image).
         //
         // --pull: forces Docker to check registry for newer base image digest.
         //   Without --pull, stale base images with known CVEs would be used.
@@ -984,7 +985,10 @@ pipeline {
     //
     // COVERAGE PUBLISHER:
     //   recordCoverage() with COBERTURA parser — reads coverage.xml generated
-    //   by pytest-cov. This is the Python equivalent of JaCoCo in the Java pipeline.
+    //   by pytest-cov. Requires the Coverage Plugin (install from Jenkins Update
+    //   Center: id = "coverage") — the old Cobertura Plugin is deprecated and
+    //   end-of-life as of 2026. The parser: 'COBERTURA' key is a parser ID
+    //   inside the unified Coverage Plugin, not the old standalone plugin.
     //   sourceCodeRetention: 'EVERY_BUILD' keeps source coverage data per build
     //   for trend analysis in the Jenkins Coverage plugin.
     // ────────────────────────────────────────────────────────────────────────
@@ -1000,7 +1004,9 @@ pipeline {
                 }
             }
 
-            // ── 2. Coverage publisher (Cobertura/pytest-cov) — guarded by fileExists
+            // ── 2. Coverage publisher (Coverage Plugin — COBERTURA parser)
+            //       Install: Jenkins Update Center → "Coverage" (id: coverage)
+            //       Do NOT install the old "Cobertura" plugin — it is deprecated.
             script {
                 if (fileExists("${APP_DIR}/coverage.xml")) {
                     recordCoverage(
