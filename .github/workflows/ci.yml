@@ -1,0 +1,854 @@
+# =============================================================
+# DevSecOps CI Pipeline — Python Monolith (Flask Student Management App)
+# Tool: GitHub Actions
+# Stack: Python 3.12 · Flask · pytest · Bandit · pip-audit · SonarQube · Trivy
+#        · Docker Hub · GHCR · Nexus
+# Reference copy: github.com/ibtisam-iq/devsecops-pipelines
+#                 pipelines/python-monolith/github-actions/ci.yml
+# Mirrors:        pipelines/python-monolith/jenkins/Jenkinsfile (16 stages)
+# =============================================================
+#
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#
+#   DOCKER_USERNAME       — Docker Hub username
+#   DOCKER_PASSWORD       — Docker Hub PAT (read/write/delete)
+#   NEXUS_USERNAME        — Nexus admin username
+#   NEXUS_PASSWORD        — Nexus admin password
+#   SONAR_TOKEN           — SonarQube user token
+#   SONAR_HOST_URL        — https://sonar.ibtisam-iq.com
+#   GIT_TOKEN             — GitHub PAT with repo scope (for CD repo update)
+#
+# NOTE: GITHUB_TOKEN is automatically provided by GitHub Actions — no secret needed for GHCR login.
+# NOTE: No MAVEN_SETTINGS_XML needed — this is Python, not Java. pip has no settings.xml equivalent.
+# =============================================================
+
+name: DevSecOps CI — Python Monolith
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.github/**'        # ci.yml-only post-merge changes don't need a full pipeline run
+      - 'Jenkinsfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.env.example'
+      - '.gitignore'
+      - 'compose.yml'
+  pull_request:
+    branches: [main]
+    # NOTE: .github/** is intentionally NOT excluded here.
+    # A PR that only modifies ci.yml must still trigger CI so the workflow
+    # change is validated before merge. Excluding .github/** from pull_request
+    # paths-ignore would cause workflow-change PRs to merge blind with no
+    # pipeline validation — the exact opposite of what PRs are for.
+    paths-ignore:
+      - 'Jenkinsfile'
+      - 'README.md'
+      - 'docs/**'
+      - 'assets/**'
+      - '.env.example'
+      - '.gitignore'
+      - 'compose.yml'
+  workflow_dispatch:
+
+# Minimal top-level permissions — every job declares only what it needs
+permissions:
+  contents: read
+
+# Cancel in-progress runs for the same branch/ref.
+#
+# cancel-in-progress is scoped to pull_request builds only.
+# cancel-in-progress: true on push-to-main is dangerous: a second push landing
+# while the first run is mid-registry-push (Stages 12-14) would cancel it after
+# some layers are uploaded but before the manifest is committed — leaving a
+# corrupt or missing :latest tag in Docker Hub, GHCR, and Nexus.
+# PR builds have no write side-effects (no push to registries, no CD update)
+# so cancellation is safe and desirable there.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # ── App metadata
+  # APP_VERSION is intentionally NOT set here — it is extracted dynamically
+  # from the VERSION file in the versioning step to avoid manual drift.
+  APP_NAME: python-monolith
+
+  # ── Docker Hub
+  DOCKER_USER: mibtisam
+  IMAGE_NAME:  mibtisam/python-monolith
+
+  # ── GHCR
+  GHCR_IMAGE: ghcr.io/ibtisam-iq/python-monolith
+
+  # ── Nexus Docker (path-based routing — no dedicated port needed)
+  NEXUS_DOCKER:      nexus.ibtisam-iq.com
+  NEXUS_DOCKER_REPO: docker-hosted
+
+  # ── App lives at repo root (no submodule path needed)
+  APP_DIR: .
+
+  # ── Python
+  PYTHON_VERSION: '3.12'
+
+  # ── Virtual environment directory (CI-scoped, matches Jenkinsfile VENV_DIR)
+  VENV_DIR: .venv-ci
+
+  # ── Application server port
+  # 5000 is the port this Flask app is configured to listen on (ARG PORT in Dockerfile).
+  # Change here if the app port changes — single source of truth for the build-arg
+  # passed to Docker at build time.
+  APP_PORT: '5000'
+
+  # ── CI database URL for test isolation
+  # Config.validate() raises EnvironmentError if DATABASE_URL is unset.
+  # Tests in tests/test_app.py are static unit tests using unittest.mock —
+  # they never call create_app() or open a real DB connection.
+  # sqlite:// (empty, in-memory) satisfies the env var presence check
+  # without requiring a running PostgreSQL instance in CI.
+  DATABASE_URL: 'sqlite://'
+
+  # ── CD GitOps handoff (Stage 15)
+  # CD repo coordinates promoted to named env vars — update here if the CD
+  # repo is renamed or the manifest path changes; no need to hunt the shell script.
+  CD_REPO:          ibtisam-iq/platform-engineering-systems
+  CD_MANIFEST_PATH: systems/python-monolith/image.env
+
+jobs:
+
+  # ════════════════════════════════════════════════════════════
+  # JOB — CI: Build, Test, Scan & Push (mirrors 16-stage Jenkinsfile)
+  # ════════════════════════════════════════════════════════════
+  ci:
+    name: CI — Build, Test & Scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    permissions:
+      contents:      read        # checkout (Stage 1)
+                                 # NOTE: Stage 15 writes to the CD repo via GIT_TOKEN PAT.
+                                 # PAT permissions are independent of GITHUB_TOKEN — do NOT
+                                 # elevate this to contents: write to fix a Stage 15 push error.
+                                 # If Stage 15 fails with permission denied, check GIT_TOKEN scope.
+      packages:      write       # push to GHCR (Stage 13)
+      pull-requests: write       # SonarQube PR decoration (Stage 8)
+      checks:        write       # pytest JUnit reporter (Stage 7)
+
+    outputs:
+      image_tag: ${{ steps.versioning.outputs.image_tag }}
+
+    steps:
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 1 — Checkout
+      # fetch-depth: 0 required for SonarQube blame info and git rev-parse.
+      # Mirrors Jenkinsfile Stage 1: checkout scm.
+      # ──────────────────────────────────────────────────────
+      - name: Checkout — source code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 2 — Trivy Filesystem Scan
+      # Runs BEFORE build — scan source + requirements.txt for secrets,
+      # misconfigs, and known CVEs in declared dependencies.
+      #
+      # Two passes mirror Jenkinsfile Stage 2 exactly:
+      #   Pass 1 — CRITICAL only, exit-code: 0 → advisory (FS scan is informational)
+      #   Pass 2 — HIGH/MEDIUM, exit-code: 0 → advisory table
+      #
+      # Both passes use exit-code: 0 — filesystem scan is advisory;
+      # the hard security gate is on the built image (Stage 10, Pass B).
+      # This matches the Jenkinsfile Stage 2 posture: both pipelines treat
+      # FS scan as informational and enforce the hard gate on the image.
+      #
+      # --skip-dirs .git,.venv-ci — excludes:
+      #   .git: false-positive secrets in pack files + speed
+      #   .venv-ci: if a prior build left the venv in the workspace, Trivy
+      #             would scan all installed packages — thousands of files with
+      #             no value. We scan requirements.txt directly, not the installed tree.
+      # ──────────────────────────────────────────────────────
+      - name: Trivy — filesystem scan (CRITICAL → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type:    fs
+          scan-ref:     ${{ env.APP_DIR }}
+          scanners:     secret,vuln,misconfig
+          severity:     CRITICAL
+          exit-code:    '0'
+          format:       json
+          output:       trivy-fs-report.json
+          skip-dirs:    .git,.venv-ci
+
+      - name: Trivy — filesystem scan (HIGH/MEDIUM → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type:    fs
+          scan-ref:     ${{ env.APP_DIR }}
+          scanners:     secret,vuln,misconfig
+          severity:     HIGH,MEDIUM
+          exit-code:    '0'
+          format:       table
+          skip-dirs:    .git,.venv-ci
+
+      # hashFiles guard — skip upload if the scan step errored before writing the file.
+      - name: Upload Trivy FS report
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('trivy-fs-report.json') != ''
+        with:
+          name:           trivy-fs-report
+          path:           trivy-fs-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 3 — Set up Python + pip cache
+      #
+      # Moved BEFORE the Versioning step (mirrors Java pipeline: Java setup
+      # before versioning). The versioning step reads VERSION via shell — no
+      # Python interpreter required there. However, setting up Python here
+      # ensures pip cache is warm before the Setup Python Environment stage.
+      #
+      # cache: pip — caches ~/.cache/pip between runs using requirements.txt
+      # as the cache key. Equivalent to Maven's cache: maven in the Java pipeline.
+      # ──────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache:          pip
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 3 — Versioning
+      # APP_VERSION is read from the VERSION file at runtime so the image tag
+      # always matches the committed version without manual sync.
+      # Format: <VERSION>-<short-sha>-<run-number>
+      # e.g.   1.0.0-ab3f12c-42
+      #
+      # Mirrors Jenkinsfile Stage 3 exactly:
+      #   - VERSION file read with cat + tr (strip whitespace)
+      #   - Guard: empty/missing VERSION → error (no silent "null" tag)
+      #   - --short=7: pins SHA to exactly 7 chars (grows without explicit length)
+      #
+      # TWO outputs written deliberately (same pattern as Java pipeline):
+      #   $GITHUB_OUTPUT  → steps.versioning.outputs.image_tag
+      #                     Safe for ${{ }} expressions in later steps.
+      #   $GITHUB_ENV     → IMAGE_TAG bash variable
+      #                     Available to run: shell blocks from the NEXT step onward.
+      #
+      # NEVER use ${{ env.IMAGE_TAG }} for runtime-computed values —
+      # the workflow-level env: block is parsed BEFORE any step runs,
+      # so IMAGE_TAG would always resolve to empty string there.
+      # ──────────────────────────────────────────────────────
+      - name: Versioning — compute image tag
+        id: versioning
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "❌ VERSION file missing — create a VERSION file at repo root with a semver string (e.g. 1.0.0)"
+            exit 1
+          fi
+          APP_VERSION=$(cat VERSION | tr -d '[:space:]')
+          if [ -z "${APP_VERSION}" ]; then
+            echo "❌ VERSION file is empty — IMAGE_TAG cannot be built without a valid version"
+            exit 1
+          fi
+          SHORT_SHA=$(git rev-parse --short=7 HEAD)
+          IMAGE_TAG="${APP_VERSION}-${SHORT_SHA}-${{ github.run_number }}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> "$GITHUB_ENV"
+          echo "🏷️  Image tag: ${IMAGE_TAG}"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 4 — Setup Python Environment
+      # Creates an isolated virtual environment and installs all dependencies.
+      #
+      # Mirrors Jenkinsfile Stage 4 exactly:
+      #   - python -m venv .venv-ci (isolated venv for this CI build)
+      #   - pip install --upgrade pip (current resolver before any package install)
+      #   - pip install -r requirements.txt (all application dependencies)
+      #   - pip install bandit pip-audit pytest-cov (CI-only tools, not in requirements.txt)
+      #
+      # WHY A VENV IN GITHUB ACTIONS (runner already has Python):
+      #   GitHub Actions ubuntu-24.04 runners have system Python. Installing
+      #   packages into system Python risks conflict with runner-managed packages.
+      #   A venv scoped to the workspace is cleaner and mirrors the Jenkinsfile
+      #   VENV_DIR strategy — isolation is consistent across both CI systems.
+      #
+      # pytest-cov: required for --cov flags in Stage 7.
+      #   If added to requirements.txt later, pip skips the already-installed
+      #   version (no-op). Kept here as a CI concern separate from app deps.
+      # ──────────────────────────────────────────────────────
+      - name: Setup Python environment — venv + dependencies
+        run: |
+          python -m venv ${VENV_DIR}
+          ${VENV_DIR}/bin/pip install --upgrade pip --quiet
+          ${VENV_DIR}/bin/pip install -r requirements.txt --quiet
+          ${VENV_DIR}/bin/pip install bandit pip-audit pytest-cov --quiet
+          echo "✅ Python environment ready"
+          ${VENV_DIR}/bin/python --version
+          ${VENV_DIR}/bin/pip --version
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 5 — Bandit SAST (Python Security Linter)
+      # Mirrors Jenkinsfile Stage 5 exactly — two-pass strategy:
+      #
+      #   Pass 1 — HIGH severity, medium confidence: FAIL build on finding
+      #            HIGH Bandit findings in Python are almost always real issues
+      #            (subprocess shell=True, eval with user input, hardcoded creds)
+      #   Pass 2 — LOW severity (catches MEDIUM+LOW): advisory JSON artifact
+      #            exit-zero: report findings without failing build
+      #
+      # Bandit scans only app/ — excludes tests/ (B101 assert false positives)
+      # and is complementary to Trivy FS (generic secrets) and SonarQube
+      # (broader SAST) — Bandit fills the Python-idiomatic security gap.
+      #
+      # WHY BANDIT IN ADDITION TO TRIVY FS AND SONARQUBE:
+      #   Trivy FS → dependency CVEs + generic secret patterns
+      #   SonarQube → code quality + broader SAST
+      #   Bandit    → Python-idiomatic: Flask debug, eval, pickle, subprocess shell=True,
+      #               SQLAlchemy injection patterns that generic SAST tools miss
+      # ──────────────────────────────────────────────────────
+      - name: Bandit SAST — HIGH severity (fail on finding)
+        run: |
+          ${VENV_DIR}/bin/bandit \
+            -r app/ \
+            --severity-level high \
+            --confidence-level medium \
+            --quiet \
+            --format txt || {
+              echo "❌ Bandit found HIGH severity security issues. Fix before proceeding."
+              exit 1
+            }
+
+      - name: Bandit SAST — MEDIUM/LOW severity (advisory artifact)
+        if: always()
+        run: |
+          ${VENV_DIR}/bin/bandit \
+            -r app/ config.py run.py \
+            --severity-level low \
+            --confidence-level low \
+            --exit-zero \
+            --format json \
+            --output bandit-report.json || true
+          echo "✅ Bandit SAST complete"
+
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('bandit-report.json') != ''
+        with:
+          name:           bandit-report
+          path:           bandit-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 6 — pip-audit Dependency CVE Scan
+      # Mirrors Jenkinsfile Stage 6 exactly.
+      #
+      # pip-audit scans requirements.txt against:
+      #   - PyPI Advisory Database (PYPA — maintained by PyPI security team)
+      #   - Open Source Vulnerabilities database (OSV)
+      #
+      # WHY PIP-AUDIT IN ADDITION TO TRIVY FS:
+      #   Trivy  → NVD + GitHub Advisory for Python packages
+      #   pip-audit → PYPA Advisory DB + OSV — broader Python-specific coverage,
+      #              especially for Flask, SQLAlchemy, Werkzeug, Jinja2, psycopg2
+      #   Defense in depth: two different advisory databases, different cadences.
+      #
+      # --requirement requirements.txt: scans declared app deps only.
+      #   Does NOT scan installed packages (which would include bandit, pip-audit
+      #   themselves — CI tools, not app concerns).
+      # --no-deps: scans only listed packages, not their transitive tree.
+      # --desc: includes CVE descriptions in output.
+      # exit 0 on both passes — same rationale as Jenkinsfile: pip-audit may flag
+      # transitive CVEs not exploitable in this app's usage pattern.
+      # ──────────────────────────────────────────────────────
+      - name: pip-audit — dependency CVE scan (advisory artifact)
+        if: always()
+        run: |
+          ${VENV_DIR}/bin/pip-audit \
+            --requirement requirements.txt \
+            --output json \
+            --desc \
+            --no-deps \
+            > pip-audit-report.json 2>&1 || true
+
+          # Human-readable table to console
+          ${VENV_DIR}/bin/pip-audit \
+            --requirement requirements.txt \
+            --desc \
+            --no-deps \
+            --format columns || true
+
+          echo "✅ pip-audit scan complete (see pip-audit-report.json for details)"
+
+      - name: Upload pip-audit report
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('pip-audit-report.json') != ''
+        with:
+          name:           pip-audit-report
+          path:           pip-audit-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 7 — Build & Test (pytest + coverage)
+      # Mirrors Jenkinsfile Stage 7 exactly.
+      #
+      # PYTEST FLAGS (identical rationale to Jenkinsfile):
+      #   --tb=short              — shortened tracebacks for CI console
+      #   -v                      — verbose test names
+      #   --junitxml              — JUnit XML for GitHub Actions JUnit reporter
+      #   --cov=app               — coverage for app/ package only
+      #   --cov-report xml        — Cobertura XML for SonarQube (Stage 8)
+      #   --cov-report term-missing — uncovered lines to console
+      #   --cov-report html       — HTML report archived as artifact
+      #   --no-header             — suppress pytest header in CI log
+      #
+      # DATABASE_URL=sqlite:// set in top-level env: block for test isolation.
+      # Config.validate() raises EnvironmentError if unset; tests never call
+      # create_app() so no actual DB connection is made.
+      #
+      # WHY NOT --cov-fail-under HERE:
+      #   Coverage enforcement belongs in SonarQube Quality Gate (Stage 9),
+      #   not in the pytest invocation. A hard --cov-fail-under in pytest
+      #   would fail BEFORE SonarQube even sees the data, making Quality Gate
+      #   irrelevant. Let SonarQube be the single coverage gate.
+      # ──────────────────────────────────────────────────────
+      - name: Build & Test — pytest with coverage
+        run: |
+          ${VENV_DIR}/bin/pytest \
+            tests/ \
+            --tb=short \
+            -v \
+            --junitxml=pytest-results.xml \
+            --cov=app \
+            --cov-report xml:coverage.xml \
+            --cov-report term-missing \
+            --cov-report html:htmlcov \
+            --no-header
+
+      # Publish JUnit test results — if: always() so it runs even on test failure.
+      # fail_on_failure: false — the pytest step itself already fails the job on
+      # test failure; a redundant double-failure signal from the reporter adds noise.
+      - name: Publish JUnit test results
+        uses: mikepenz/action-junit-report@v5
+        if: always()
+        with:
+          report_paths:    'pytest-results.xml'
+          check_name:      pytest Test Results
+          fail_on_failure: false
+
+      # hashFiles guard — same as Java pipeline FIX R4#11 equivalent.
+      # If the pipeline fails before Stage 7, coverage.xml does not exist.
+      # Without the guard, upload-artifact would create a misleading zero-byte artifact.
+      - name: Upload coverage report (HTML)
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('htmlcov/index.html') != ''
+        with:
+          name:           coverage-html-report
+          path:           htmlcov/
+          retention-days: 14
+
+      - name: Upload coverage XML (Cobertura — for SonarQube)
+        uses: actions/upload-artifact@v4
+        if: always() && hashFiles('coverage.xml') != ''
+        with:
+          name:           coverage-xml
+          path:           coverage.xml
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 8 — SonarQube Analysis
+      # Mirrors Jenkinsfile Stage 8 exactly.
+      #
+      # Uses the official SonarQube Scan GitHub Action (not the Maven plugin —
+      # this is Python). The action wraps sonar-scanner CLI internally.
+      #
+      # KEY SONAR PROPERTIES FOR PYTHON (identical to Jenkinsfile):
+      #   sonar.language=py               — explicit Python language declaration
+      #   sonar.python.version=3.12       — must match runtime Python version
+      #   sonar.sources=app               — app source only (not tests)
+      #   sonar.tests=tests               — test directory declared separately
+      #   sonar.python.coverage.reportPaths=coverage.xml  — Cobertura XML from pytest-cov
+      #   sonar.python.xunit.reportPath=pytest-results.xml — JUnit XML from pytest
+      #   sonar.exclusions                — venv, htmlcov, migrations, static assets
+      #
+      # sonar.working.directory pins report-task.txt for Quality Gate (Stage 9).
+      # SONAR_TOKEN and SONAR_HOST_URL injected via env: — never hardcoded.
+      # ──────────────────────────────────────────────────────
+      - name: SonarQube — static analysis (Python)
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=IbtisamIQpythonmonolith
+            -Dsonar.projectName=IbtisamIQpythonmonolith
+            -Dsonar.projectVersion=${{ steps.versioning.outputs.image_tag }}
+            -Dsonar.language=py
+            -Dsonar.python.version=3.12
+            -Dsonar.sources=app
+            -Dsonar.tests=tests
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.python.xunit.reportPath=pytest-results.xml
+            -Dsonar.exclusions=**/__pycache__/**,**/*.pyc,.venv-ci/**,htmlcov/**,app/static/**,app/templates/**
+            -Dsonar.test.exclusions=tests/**
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.working.directory=${{ github.workspace }}/.scannerwork
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 9 — Quality Gate
+      # Blocks pipeline until SonarQube webhook fires with pass/fail.
+      # Mirrors Jenkinsfile Stage 9: waitForQualityGate abortPipeline: true.
+      #
+      # scanMetadataReportFile must match -Dsonar.working.directory above.
+      # SHA-pinned — supply-chain hardening (same rationale as Trivy action pin).
+      # A semver tag can be force-pushed to a malicious commit; a SHA is immutable.
+      #
+      # timeout-minutes: 5 — step-level timeout, kills the poll after 5 min.
+      # Sufficient for this codebase (analysis completes in < 2 min in practice).
+      # ──────────────────────────────────────────────────────
+      - name: SonarQube — Quality Gate check
+        uses: sonarsource/sonarqube-quality-gate-action@cf038b0e0cdecfa9e56c198bbb7d21d751d62c3b # v1.2.0
+        timeout-minutes: 5
+        with:
+          scanMetadataReportFile: ${{ github.workspace }}/.scannerwork/report-task.txt
+        env:
+          SONAR_TOKEN:    ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 10 — Registry Logins (BEFORE Docker build)
+      # All three registry logins happen here so that image tag resolution
+      # and daemon availability are guaranteed before docker build runs.
+      #
+      # NOTE: Logins are intentionally NOT gated to main-only.
+      # On PR builds, the login is required to pull cached layers from the
+      # registry for BuildKit cache (cache-from: type=gha). Without login,
+      # authenticated cache pulls fail silently → cold cache → slower builds.
+      #
+      # Mirrors Jenkinsfile Stages 12-14 login steps (withCredentials blocks).
+      # ──────────────────────────────────────────────────────
+      - name: Docker Hub — login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: GHCR — login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nexus — login
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.NEXUS_DOCKER }}
+          username: ${{ secrets.NEXUS_USERNAME }}
+          password: ${{ secrets.NEXUS_PASSWORD }}
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 11 — Docker Build
+      # Mirrors Jenkinsfile Stage 10 exactly.
+      #
+      # load: true  → image loaded into local daemon for Trivy scan (Stage 12)
+      # push: false → push happens AFTER Trivy passes (Stages 13-15), main only
+      #
+      # CONSTRAINT: load: true is INCOMPATIBLE with multi-platform builds.
+      # If you ever add platforms: linux/amd64,linux/arm64, you must either:
+      #   (a) build → push directly (remove load: true, set push: true), or
+      #   (b) build amd64 only for the scan, then rebuild multi-arch for push.
+      # Current setup: single-platform amd64 only — load: true works correctly.
+      #
+      # NOTE: Build is intentionally NOT gated to main-only — PR builds must
+      # build + scan the image (Stages 11-12) to catch CVEs before merge.
+      # Only the push steps (Stages 13-15) are gated to main.
+      #
+      # PORT build-arg: uses APP_PORT (5000) — matches Dockerfile ARG PORT default.
+      # --pull in Jenkinsfile → pull: true equivalent in build-push-action.
+      #
+      # WHY SAME BASE FOR BUILDER AND RUNTIME (python:3.12-slim both stages):
+      #   Python builds don't produce a compiled binary separable from its runtime.
+      #   The venv IS the artifact — it must run on the same Python interpreter
+      #   it was installed on. python:3.12-slim for both stages is correct.
+      #
+      # image.created label: uses head_commit.timestamp (push events) with
+      # fallback to run_started_at (workflow_dispatch and other trigger types
+      # where head_commit is null). Both are RFC 3339 timestamps per OCI spec.
+      # ──────────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Build — build image (load into daemon for scan + push)
+        uses: docker/build-push-action@v6
+        with:
+          context:    ${{ env.APP_DIR }}
+          push:       false
+          load:       true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:${{ steps.versioning.outputs.image_tag }}
+            ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
+          build-args: |
+            PORT=${{ env.APP_PORT }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.versioning.outputs.image_tag }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp || github.run_started_at }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 12 — Trivy Image Scan
+      # Mirrors Jenkinsfile Stage 11 exactly — three-pass strategy:
+      #
+      #   Pass A — OS packages (python:3.12-slim = Debian Bookworm base):
+      #            vuln-type os, CRITICAL+HIGH, exit-code: 0 → warn only.
+      #            OS CVEs are Debian/Python maintainer's responsibility —
+      #            we surface them but don't block the build on them.
+      #
+      #   Pass B — Library (pip packages from requirements.txt in venv):
+      #            vuln-type library, CRITICAL only, exit-code: 1 → FAIL build.
+      #            These are YOUR dependencies — fix = bump version in requirements.txt.
+      #            HIGH/MEDIUM follow with exit-code: 0 for advisory table.
+      #
+      #   Pass C — Full audit report (all types + severities incl. LOW):
+      #            exit-code: 0, JSON format → archived artifact.
+      #            LOW intentionally INCLUDED for image scan (excluded from FS scan).
+      #
+      # Trivy image scan resolves tags against the local Docker daemon first.
+      # Since Stage 11 uses load: true, the image is present locally under
+      # the exact tags specified — Trivy scans the just-built image.
+      #
+      # Pass B has no if: always() — intentional. If Stage 11 (Docker build)
+      # fails, there is no image to scan; running trivy image against a
+      # non-existent image produces a misleading error on top of the real failure.
+      # ──────────────────────────────────────────────────────
+
+      # Pass A — OS packages: warn only (Debian/Python maintainer responsibility)
+      - name: Trivy — image scan OS packages (CRITICAL+HIGH → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: os
+          severity:  CRITICAL,HIGH
+          exit-code: '0'
+          format:    table
+
+      # Pass B — Library (pip packages) CRITICALs: FAIL the build
+      # These are YOUR dependencies in requirements.txt. Fix = bump version.
+      # No if: always() — intentional. See Stage 12 header comment above.
+      - name: Trivy — image scan pip/library (CRITICAL → fail)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: library
+          severity:  CRITICAL
+          exit-code: '1'
+          format:    table
+
+      # Pass B (cont.) — Library HIGH/MEDIUM: warn only
+      - name: Trivy — image scan pip/library (HIGH/MEDIUM → warn only)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          vuln-type: library
+          severity:  HIGH,MEDIUM
+          exit-code: '0'
+          format:    table
+
+      # Pass C — Full report for audit trail (all vuln-types, all severities incl. LOW)
+      - name: Trivy — image scan full report (audit artifact)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        if: always()
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_NAME }}:${{ steps.versioning.outputs.image_tag }}
+          severity:  CRITICAL,HIGH,MEDIUM,LOW
+          exit-code: '0'
+          format:    json
+          output:    trivy-image-report.json
+
+      - name: Upload Trivy image report (audit artifact)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name:           trivy-image-report
+          path:           trivy-image-report.json
+          retention-days: 14
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 13 — Push to Docker Hub
+      # Guarded to main push only — images must not be pushed to any registry
+      # on pull_request builds. Build + scan (Stages 11-12) run on PRs to
+      # catch CVEs before merge; publishing does not.
+      #
+      # WHY bare $IMAGE_TAG and NOT ${{ env.IMAGE_TAG }}:
+      # IMAGE_TAG is a runtime-computed value written to $GITHUB_ENV by the
+      # versioning step. The ${{ env.IMAGE_TAG }} expression is parsed BEFORE
+      # any step runs — it would always resolve to empty string here.
+      # Bare $IMAGE_TAG reads from the bash environment (populated from
+      # $GITHUB_ENV at step start) and correctly gets the versioning output.
+      # Static env vars like IMAGE_NAME (set in top-level env: block) are safe
+      # to use with ${{ env.* }} because they are known at parse time.
+      #
+      # Mirrors Jenkinsfile Stage 12 (Push to Docker Hub).
+      # ──────────────────────────────────────────────────────
+      - name: Docker Hub — push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:$IMAGE_TAG
+          docker push ${{ env.IMAGE_NAME }}:latest
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 14 — Push to GitHub Container Registry (GHCR)
+      # (Same $IMAGE_TAG rationale and main-only guard as Stage 13.)
+      # Mirrors Jenkinsfile Stage 13 (Push to GHCR).
+      # ghcr.io/ibtisam-iq/python-monolith:<tag>
+      # ──────────────────────────────────────────────────────
+      - name: GHCR — push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.GHCR_IMAGE }}:$IMAGE_TAG
+          docker push ${{ env.GHCR_IMAGE }}:latest
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 15 — Push to Nexus Docker Registry (path-based routing)
+      # (Same $IMAGE_TAG rationale and main-only guard as Stage 13.)
+      # Mirrors Jenkinsfile Stage 14 (Push to Nexus Registry).
+      # nexus.ibtisam-iq.com/docker-hosted/python-monolith:<tag>
+      #
+      # Pre-requisites (same as Jenkinsfile comment):
+      #   1. Hosted Docker repo with "Path based routing" selected
+      #   2. Security → Realms → Docker Bearer Token Realm active
+      # ──────────────────────────────────────────────────────
+      - name: Nexus — push image (path-based routing)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG
+          docker push ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 15b — Push to AWS ECR  [PLANNED — commented out]
+      # Uncomment once AWS credentials and ECR repo are provisioned.
+      # Same pattern as java-monolith Stage 13b.
+      # ──────────────────────────────────────────────────────
+      # - name: AWS ECR — login
+      #   uses: aws-actions/amazon-ecr-login@v2
+      # - name: AWS ECR — tag and push
+      #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      #   run: |
+      #     ECR_IMAGE="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ env.APP_NAME }}"
+      #     docker tag ${{ env.IMAGE_NAME }}:$IMAGE_TAG "${ECR_IMAGE}:${IMAGE_TAG}"
+      #     docker tag ${{ env.IMAGE_NAME }}:latest     "${ECR_IMAGE}:latest"
+      #     docker push "${ECR_IMAGE}:${IMAGE_TAG}"
+      #     docker push "${ECR_IMAGE}:latest"
+
+      # ──────────────────────────────────────────────────────
+      # STAGE 16 — Update CD Repo (GitOps handoff)
+      # Runs only on push to main AND only if all prior steps succeeded
+      # (success() is the implicit default when no status function is given).
+      # Mirrors Jenkinsfile Stage 16 (Update CD Repo) exactly — all hardening
+      # patterns carried over:
+      #
+      # TOKEN OFF ARGV (mirrors Jenkinsfile R4#2 equivalent):
+      #   Clone with public URL → set-url with token after clone → push.
+      #   `git clone https://x-access-token:${TOKEN}@...` embeds the token
+      #   in argv, visible to ps/proc scanners for the duration of the clone.
+      #   Setting the authenticated URL after clone via `git remote set-url`
+      #   never puts the token in a process argument — writes to .git/config
+      #   (in-memory, not exposed to ps). Token cleared after push.
+      #
+      # IMAGE_TAG GUARD (mirrors Jenkinsfile IMAGE_TAG guard):
+      #   $IMAGE_TAG (not ${{ env.IMAGE_TAG }}) — shell evaluates at runtime.
+      #   If IMAGE_TAG is empty, abort rather than writing "IMAGE_TAG=" to
+      #   the manifest and triggering ArgoCD with an invalid tag.
+      #
+      # UNIQUE TMP DIR: cd-repo — distinct from app source directories.
+      #
+      # GIT DIFF GUARD: git diff --cached --quiet — precise "nothing staged"
+      #   detection without swallowing real commit errors.
+      #
+      # HEAD PUSH: git push origin HEAD — resilient to CD repo branch renames.
+      #
+      # git config --local: identity scoped to this repo only.
+      # ──────────────────────────────────────────────────────
+      - name: Update CD repo — GitOps image tag handoff
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          # IMAGE_TAG GUARD — abort if empty (would write invalid manifest)
+          if [ -z "${IMAGE_TAG}" ]; then
+            echo "❌ IMAGE_TAG is empty — aborting CD repo update"
+            exit 1
+          fi
+
+          # Unique tmp dir — no collision with app source directories
+          rm -rf cd-repo
+
+          # TOKEN OFF ARGV — clone public URL; token never in process argv
+          git clone https://github.com/${CD_REPO}.git cd-repo
+          cd cd-repo
+
+          # Set authenticated remote after clone — writes to .git/config, not argv
+          git remote set-url origin https://x-access-token:${GIT_TOKEN}@github.com/${CD_REPO}.git
+
+          git config --local user.email "github-actions@ibtisam-iq.com"
+          git config --local user.name  "GitHub Actions CI"
+
+          mkdir -p "$(dirname "${CD_MANIFEST_PATH}")"
+
+          # Once K8s/Helm manifests exist, replace with:
+          # sed -i "s|image: mibtisam/python-monolith:.*|image: mibtisam/python-monolith:${IMAGE_TAG}|g" \
+          #     deployments/python-monolith/deployment.yaml
+
+          echo "IMAGE_TAG=${IMAGE_TAG}" > "${CD_MANIFEST_PATH}"
+          git add "${CD_MANIFEST_PATH}"
+
+          # PRECISE "nothing staged" detection — does NOT swallow real errors
+          git diff --cached --quiet \
+            && echo "ℹ️  Nothing to commit — image tag unchanged" \
+            || { git commit -m "ci: update python-monolith image tag to ${IMAGE_TAG} [skip ci]" && git push origin HEAD; }
+
+          # Clear token from remote URL — not left in workspace
+          git remote set-url origin https://github.com/${CD_REPO}.git
+
+      # ──────────────────────────────────────────────────────
+      # Cleanup — remove local Docker images
+      # (Same $IMAGE_TAG rationale as Stage 13 — see comment above.)
+      # Mirrors Jenkinsfile post{} Docker cleanup block.
+      # ──────────────────────────────────────────────────────
+      - name: Cleanup — remove local Docker images
+        if: always()
+        run: |
+          docker rmi ${{ env.IMAGE_NAME }}:$IMAGE_TAG                                                             || true
+          docker rmi ${{ env.IMAGE_NAME }}:latest                                                                 || true
+          docker rmi ${{ env.GHCR_IMAGE }}:$IMAGE_TAG                                                            || true
+          docker rmi ${{ env.GHCR_IMAGE }}:latest                                                                 || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:$IMAGE_TAG         || true
+          docker rmi ${{ env.NEXUS_DOCKER }}/${{ env.NEXUS_DOCKER_REPO }}/${{ env.APP_NAME }}:latest             || true
+          docker image prune -f || true
+
+      # ──────────────────────────────────────────────────────
+      # Cleanup — remove cloned CD repo (if Stage 16 ran)
+      # Separated from image cleanup — different concerns.
+      # rm -rf on a non-existent path exits 0 — safe no-op on PR builds.
+      # Mirrors Jenkinsfile post{} CD tmp dir cleanup: rm -rf _cd_repo_tmp.
+      # ──────────────────────────────────────────────────────
+      - name: Cleanup — remove cloned CD repo workspace
+        if: always()
+        run: rm -rf cd-repo
