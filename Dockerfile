@@ -68,12 +68,19 @@ USER appuser
 EXPOSE ${PORT}
 
 # Health check — calls /health endpoint added in routes.py.
-# CMD-SHELL is used explicitly so ${PORT:-5000} is expanded by the shell at runtime.
+# CMD (shell form) is used so the shell expands ${PORT:-5000} at runtime.
+# In a Dockerfile, HEALTHCHECK supports two forms:
+#   CMD ["executable", "arg"]  — exec form: no shell, no variable expansion
+#   CMD <command>              — shell form: wrapped in sh -c, variables expand
+# CMD-SHELL is NOT a valid Dockerfile keyword — it exists only in the Docker API
+# and docker inspect output as an internal representation of the shell form.
+# Using CMD here is identical to CMD-SHELL in behaviour: Docker invokes
+# sh -c "<command>" under the hood.
 # start_period=40s: Flask + SQLAlchemy + PostgreSQL connection pool cold start
 # can take 20-40s — 40s gives ample grace without being excessive.
 # Kubernetes uses its own liveness/readiness probes — this is for Docker and Compose.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD-SHELL python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-5000}/health')" \
     || exit 1
 
 # Production entrypoint: gunicorn serves the Flask app.
