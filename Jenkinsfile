@@ -4,7 +4,7 @@
 // Stack: Python 3.12 · Flask · pytest · Bandit · pip-audit · SonarQube · Trivy
 //        · Docker Hub · GHCR · Nexus
 // Credentials: sonarqube-token · github-creds · docker-creds · nexus-creds · ghcr-creds
-// SonarQube server: sonar-server  |  Scanner: sonar-scanner (CLI, not Maven plugin)
+// SonarQube server: sonar-server  |  Scanner: sonar-scanner
 //
 // ── REQUIRED JENKINS PLUGINS ──────────────────────────────────────────────────
 //   - SonarQube Scanner Plugin    → provides withSonarQubeEnv()
@@ -85,12 +85,12 @@ pipeline {
     agent { label 'built-in || linux' }
 
     // ── tools block is NOT used here.
-    // Python 3.12, pip, sonar-scanner, trivy, docker are all installed
-    // system-wide on the Jenkins OS via the install-pipeline-tools script
-    // and are available on OS PATH. Jenkins resolves them via sh without
-    // any UI registration.
-    // The only tool registered in Manage Jenkins → Tools is sonar-scanner,
-    // injected via withSonarQubeEnv() — not declared in tools{}.
+    // Python 3.12, pip, trivy, and docker are installed system-wide on the
+    // Jenkins OS and are available on OS PATH.
+    // sonar-scanner is NOT installed system-wide — it is registered in
+    // Manage Jenkins → Tools → SonarQube Scanner as 'sonar-scanner'.
+    // SCANNER_HOME = tool 'sonar-scanner' in environment{} resolves its
+    // install path at runtime; $SCANNER_HOME/bin/sonar-scanner invokes it.
 
     environment {
         // ── App metadata
@@ -152,6 +152,8 @@ pipeline {
         // Update here if the CD repo is renamed or the manifest path changes.
         CD_REPO          = 'ibtisam-iq/platform-engineering-systems'
         CD_MANIFEST_PATH = 'systems/python-monolith/image.env'
+
+        SCANNER_HOME = tool 'sonar-scanner'
     }
 
     options {
@@ -559,7 +561,7 @@ pipeline {
                     echo '🔍 Running SonarQube static analysis (Python)...'
                     withSonarQubeEnv('sonar-server') {
                         sh """
-                            sonar-scanner \\
+                            $SCANNER_HOME/bin/sonar-scanner \\
                                 -Dsonar.projectKey=IbtisamIQpythonmonolith \\
                                 -Dsonar.projectName=IbtisamIQpythonmonolith \\
                                 -Dsonar.projectVersion=${IMAGE_TAG} \\
