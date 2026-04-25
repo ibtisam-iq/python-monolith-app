@@ -820,7 +820,18 @@ jobs:
           # sed -i "s|image: mibtisam/python-monolith:.*|image: mibtisam/python-monolith:${IMAGE_TAG}|g" \
           #     deployments/python-monolith/deployment.yaml
 
-          echo "IMAGE_TAG=${IMAGE_TAG}" > "${CD_MANIFEST_PATH}"
+          echo "=== Current manifest ==="
+          cat ${CD_MANIFEST_PATH} 2>/dev/null || echo "(file does not exist yet)"
+
+          echo "=== Writing new manifest ==="
+          cat > ${CD_MANIFEST_PATH} << EOF
+          IMAGE_TAG=${IMAGE_TAG}
+          UPDATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          UPDATED_BY=github-actions-run-${{ github.run_number }}
+          GIT_COMMIT=${{ github.sha }}
+          GIT_BRANCH=${{ github.ref_name }}
+          EOF
+          
           git add "${CD_MANIFEST_PATH}"
 
           # PRECISE "nothing staged" detection — does NOT swallow real errors
