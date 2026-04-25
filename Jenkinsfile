@@ -939,8 +939,14 @@ pipeline {
                                 # sed -i "s|image: mibtisam/python-monolith:.*|image: mibtisam/python-monolith:\${IMAGE_TAG}|g" \\
                                 #     deployments/python-monolith/deployment.yaml
 
-                                # IMAGE_TAG escaped — shell runtime evaluation
-                                echo "IMAGE_TAG=\${IMAGE_TAG}" > "${CD_MANIFEST_PATH}"
+                                echo "=== Writing new manifest ==="
+                                cat > ${CD_MANIFEST_PATH} << EOF
+IMAGE_TAG=${IMAGE_TAG}
+UPDATED_AT=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+UPDATED_BY=jenkins-build-${BUILD_NUMBER}
+GIT_COMMIT=${GIT_COMMIT}
+GIT_BRANCH=${GIT_BRANCH}
+EOF
 
                                 git add "${CD_MANIFEST_PATH}"
 
